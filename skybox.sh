@@ -11,6 +11,7 @@
 # - Nginx 监听 80，用于 acme.sh webroot 续签
 # - Nginx 监听 127.0.0.1:8443 ssl，用于 Reality 自偷
 # - VLESS-REALITY 监听公网 443
+# - 已兼容 sing-box 1.13+，不再使用 legacy inbound fields
 # ==========================================================
 
 RED='\033[0;31m'
@@ -140,6 +141,13 @@ EOF
     fi
 }
 
+cleanup_legacy_inbound_fields() {
+    if [ -f "$CONFIG_FILE" ] && command -v jq >/dev/null 2>&1 && jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        TMP=$(mktemp)
+        jq '(.inbounds[]?) |= del(.sniff, .sniff_override_destination, .sniff_timeout, .domain_strategy, .udp_disable_domain_unmapping)' "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
+    fi
+}
+
 backup_config() {
     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%s)"
 }
@@ -154,6 +162,8 @@ check_singbox_config() {
         return 1
     fi
 
+    cleanup_legacy_inbound_fields
+
     sing-box check -c "$CONFIG_FILE" >/tmp/singbox_check.log 2>&1
     if [ $? -ne 0 ]; then
         echo -e "${RED}sing-box 配置检查失败：${NC}"
@@ -166,8 +176,7 @@ check_singbox_config() {
 
 # ==========================================================
 # Nginx 核心配置自愈
-# 注意：这个函数不会在脚本启动时执行。
-# 只有选择第 3 步部署网站时才执行。
+# 只有选择第 3 步部署网站时才执行
 # ==========================================================
 ensure_nginx_core_config() {
     mkdir -p /etc/nginx
@@ -307,9 +316,7 @@ EOF
 
 # ==========================================================
 # 基础环境初始化
-# 注意：
-# 这里不安装 Nginx。
-# 这里只安装 sing-box / SS2022 / 菜单所需基础依赖。
+# 不安装 Nginx
 # ==========================================================
 init_env() {
     mkdir -p "$CONFIG_DIR"
@@ -340,6 +347,7 @@ init_env() {
     fi
 
     ensure_json
+    cleanup_legacy_inbound_fields
 
     if [ ! -f /usr/local/bin/sk ]; then
         ln -sf "$(realpath "$0")" /usr/local/bin/sk 2>/dev/null
@@ -488,6 +496,7 @@ EOF
     rm -rf "$TMP_DIR"
 
     ensure_json
+    cleanup_legacy_inbound_fields
 
     systemctl daemon-reload
     systemctl enable sing-box >/dev/null 2>&1
@@ -907,6 +916,9 @@ add_vless_reality() {
     backup_config
 
     TMP=$(mktemp)
+
+    # sing-box 1.13+ 已移除 legacy inbound fields，
+    # 这里不再写 sniff / sniff_override_destination。
     jq \
       --arg tag "$TAG" \
       --arg uuid "$UUID" \
@@ -918,8 +930,6 @@ add_vless_reality() {
         "tag": $tag,
         "listen": "::",
         "listen_port": 443,
-        "sniff": true,
-        "sniff_override_destination": true,
         "users": [
           {
             "uuid": $uuid,
