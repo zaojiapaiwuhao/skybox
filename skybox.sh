@@ -219,7 +219,7 @@ deploy_website() {
     sed -i '/MY_DOMAIN=/d' "$ENV_FILE"
     echo "MY_DOMAIN=\"$DOMAIN\"" >> "$ENV_FILE"
 
-    # 修复点 1：确保 Nginx 核心配置目录树必须存在
+    # 确保 Nginx 核心配置目录树必须存在
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
     mkdir -p /var/www/skyvault-drive/.well-known/acme-challenge
 
@@ -243,7 +243,7 @@ EOF
         source ~/.bashrc
     fi
     
-    # 修复点 2：剔除不受支持的 --tailscale no 参数，还原最稳固的验证流
+    # 剔除不受支持的 --tailscale no 参数，采用稳固的 webroot 验证流
     ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --webroot /var/www/skyvault-drive --non-interactive
 
     if [ ! -f "$HOME/.acme.sh/${DOMAIN}_ecc/fullchain.cer" ]; then
@@ -649,6 +649,7 @@ while true; do
     echo -e "        SkyVault Drive 核心高级交互式菜单"
     echo -e "=================================================="
     echo -e " ${GREEN}1)${NC} 安装 / 更新 sing-box 核心环境 (带版本智能校验)"
+    echo -e " ${GREEN}1)${NC} 安装 / 更新 sing-box 核心环境 (带版本智能校验)"
     echo -e " ${GREEN}2)${NC} 添加 Shadowsocks 2022 节点 (多加密可选)"
     echo -e " ${GREEN}3)${NC} 部署 / 更新 SkyVault Drive 伪装网站 (全自动SSL)"
     echo -e " ${GREEN}4)${NC} 添加 VLESS-REALITY 节点 (自偷混淆模式)"
@@ -657,7 +658,7 @@ while true; do
     echo -e " ${PURPLE}7) 删除指定不需要的代理节点${NC}"
     echo -e " ${RED}8) 🚨 一键彻底卸载面板、环境、定时任务、Nginx与脚本自毁 (干净利落)${NC}"
     echo -e " ${PLAIN}0) 优雅安全退出脚本${NC}"
-    echo -e "${BLUE}==================================================${NC}"
+    echo -e "${BLUE}=================================================="
     read -p "请选择操作 [0-8]: " CHOICE
 
     case $CHOICE in
