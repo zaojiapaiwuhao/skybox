@@ -42,7 +42,6 @@ init_env() {
     fi
     source "$ENV_FILE"
 
-    # ✨ 改用系统级软链接，无需 source，瞬间全域生效
     if [ ! -f /usr/local/bin/sk ]; then
         ln -sf "$(realpath "$0")" /usr/local/bin/sk
         chmod +x /usr/local/bin/sk
@@ -52,19 +51,18 @@ init_env() {
     if ! command -v jq &> /dev/null || ! command -v nginx &> /dev/null; then
         echo -e "${YELLOW}正在安装系统核心组件 (Nginx, jq, cron, socat, openssl)...${NC}"
         apt-get update -y
-        apt-get install -y jq curl wget openssl socat nginx unzip cron
+        apt-get install -y jq curl wget openssl socat nginx unzip cron psmisc
         mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
         systemctl enable nginx
         systemctl start nginx
     fi
 
-    # 初始化最基础的 sing-box 骨架
     if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ]; then
         echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' > "$CONFIG_FILE"
     fi
 }
 
-# 1. 纯净流：智能版本校验 + 架构识别部署
+# 1. 智能版本校验 + 架构识别部署
 install_singbox() {
     echo -e "${BLUE}[1] 开始检查 sing-box 核心环境...${NC}"
     
@@ -219,40 +217,61 @@ deploy_website() {
     sed -i '/MY_DOMAIN=/d' "$ENV_FILE"
     echo "MY_DOMAIN=\"$DOMAIN\"" >> "$ENV_FILE"
 
-    # 确保 Nginx 核心配置目录树必须存在
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-    mkdir -p /var/www/skyvault-drive/.well-known/acme-challenge
+    # 🛠️ 终极防御机制：如果发现系统级的 nginx.conf 被误删，脚本自动补全自愈
+    if [ ! -f /etc/nginx/nginx.conf ]; then
+        echo -e "${YELLOW}警告：检测到系统核心 nginx.conf 丢失，正在自动重构基础骨架...${NC}"
+        mkdir -p /etc/nginx
+        cat << 'EOF' > /etc/nginx/nginx.conf
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+include /etc/nginx/modules-enabled/*.conf;
 
-    cat << EOF > /etc/nginx/sites-available/default
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $DOMAIN;
-    root /var/www/skyvault-drive;
-    location /.well-known/acme-challenge/ {
-        allow all;
-    }
+events {
+    worker_connections 768;
+}
+
+http {
+    sendfile on;
+    tcp_nopush on;
+    types_hash_max_size 2048;
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log;
+    gzip on;
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/sites-enabled/*;
 }
 EOF
-    # 建立软链接确保 Nginx 能够正确载入它
-    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
-    systemctl restart nginx
+    fi
+
+    # 强行释放 80 端口，停止 Nginx，为独立模式清理赛道
+    echo -e "${YELLOW}正在强行释放 80 端口，暂停占道服务...${NC}"
+    systemctl stop nginx &>/dev/null
+    fuser -k 80/tcp 443/tcp &>/dev/null
 
     if [ ! -f "$HOME/.acme.sh/acme.sh" ]; then
         curl https://get.acme.sh | sh -s email="admin@$DOMAIN"
         source ~/.bashrc
     fi
     
-    # 剔除不受支持的 --tailscale no 参数，采用稳固的 webroot 验证流
-    ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --webroot /var/www/skyvault-drive --non-interactive
+    # 强制全域改用 Let's Encrypt 签发通道
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+
+    echo -e "${YELLOW}正在通过 Let's Encrypt 独立服务器模式验证/申请证书...${NC}"
+    ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone
 
     if [ ! -f "$HOME/.acme.sh/${DOMAIN}_ecc/fullchain.cer" ]; then
-        echo -e "${RED}证书签发失败！请确认 80 端口无占用且防火墙已放行。${NC}"
+        echo -e "${RED}证书签发依旧失败！${NC}"
         read -p "按回车键返回..."
         return
     fi
 
-    # 渲染前端伪装页
+    # 证书成功到手后，开始创建前端目录和文件
+    mkdir -p /var/www/skyvault-drive
     cat << 'EOF' > /var/www/skyvault-drive/index.html
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -265,7 +284,6 @@ EOF
 <body class="bg-[#0f172a] text-slate-200 font-sans flex items-center justify-center min-h-screen selection:bg-indigo-500 selection:text-white">
     <div class="absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(99,102,241,0.08),transparent_45%)] pointer-events-none"></div>
     <div class="absolute inset-0 bg-[linear-gradient(to_bottom,rgba(15,23,42,0.4),#0f172a)] pointer-events-none"></div>
-    
     <div class="max-w-md w-full bg-slate-900/40 p-8 rounded-2xl shadow-2xl border border-slate-800/80 backdrop-blur-xl relative z-10">
         <div class="text-center mb-8">
             <div class="w-16 h-16 bg-gradient-to-tr from-indigo-600 to-violet-500 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-xl shadow-indigo-900/30 border border-indigo-400/20">
@@ -274,29 +292,19 @@ EOF
             <h2 class="text-2xl font-bold tracking-tight bg-gradient-to-r from-indigo-200 via-slate-100 to-violet-200 bg-clip-text text-transparent">SkyVault Drive</h2>
             <p class="text-xs text-slate-400 mt-2 font-mono uppercase tracking-widest">分布式加密网关集群</p>
         </div>
-        
         <form onsubmit="event.preventDefault(); document.getElementById('btn-txt').innerText='正在验证安全令牌...'; setTimeout(()=>{alert('安全网关鉴权失败：节点拒绝连接'); document.getElementById('btn-txt').innerText='安全验证进入受信任区';}, 1500);" class="space-y-5">
             <div>
                 <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider">节点签名 (UID)</label>
-                <div class="mt-1 relative">
-                    <input type="text" required class="w-full p-3 bg-slate-950/60 border border-slate-800/80 rounded-xl focus:outline-none focus:border-indigo-500 text-slate-200 placeholder-slate-600 text-sm transition-all duration-200" placeholder="storage-node-0x...">
-                </div>
+                <input type="text" required class="w-full p-3 bg-slate-950/60 border border-slate-800/80 rounded-xl focus:outline-none focus:border-indigo-500 text-slate-200 placeholder-slate-600 text-sm transition-all duration-200" placeholder="storage-node-0x...">
             </div>
             <div>
                 <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider">动态令牌密钥 (Cluster Key)</label>
                 <input type="password" required class="w-full mt-1 p-3 bg-slate-950/60 border border-slate-800/80 rounded-xl focus:outline-none focus:border-indigo-500 text-slate-200 placeholder-slate-600 text-sm transition-all duration-200" placeholder="••••••••••••••••">
             </div>
-            
-            <div class="flex items-center justify-between text-xs text-slate-500">
-                <label class="flex items-center space-x-2 cursor-pointer"><input type="checkbox" class="rounded bg-slate-950 border-slate-800 text-indigo-600 focus:ring-0"> <span>保持本设备授信</span></label>
-                <a href="#" class="hover:text-indigo-400 transition">硬件密钥登录</a>
-            </div>
-
-            <button type="submit" class="w-full bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white p-3 rounded-xl font-medium active:scale-[0.99] transition-all duration-150 shadow-lg shadow-indigo-900/40 border border-indigo-500/20">
+            <button type="submit" class="w-full bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white p-3 rounded-xl font-medium transition-all duration-150 shadow-lg border border-indigo-500/20">
                 <span id="btn-txt">安全验证进入受信任区</span>
             </button>
         </form>
-        
         <div class="mt-8 pt-6 border-t border-slate-800/60 flex items-center justify-between text-[11px] text-slate-500 font-mono">
             <span>STATUS: ENCRYPTED</span>
             <span>&copy; 2026 SkyVault Infrastructure</span>
@@ -306,19 +314,14 @@ EOF
 </html>
 EOF
 
+    # 写入全新的 Nginx 虚拟主机配置
+    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
     cat << EOF > /etc/nginx/sites-available/default
 server {
     listen 80;
     listen [::]:80;
     server_name $DOMAIN;
-    
-    location /.well-known/acme-challenge/ {
-        root /var/www/skyvault-drive;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
+    return 301 https://\$host\$request_uri;
 }
 
 server {
@@ -339,8 +342,18 @@ server {
     }
 }
 EOF
-
+    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+    
+    echo -e "${YELLOW}正在拉起并检测 Nginx 状态...${NC}"
     systemctl restart nginx
+    
+    if ! systemctl is-active nginx &>/dev/null; then
+        echo -e "${RED}出错了！Nginx 依然无法正常启动。下面是系统环境抛出的底层错误：${NC}"
+        nginx -t
+        read -p "请保留上述错误截图并按回车键返回..."
+        return
+    fi
+
     echo -e "${GREEN}SkyVault Drive 伪装系统已经自动就绪！${NC}"
     read -p "按回车键返回..."
 }
@@ -535,7 +548,6 @@ delete_config() {
     fi
 
     TARGET_TAG=$(jq -r ".inbounds[$DEL_INDEX].tag" "$CONFIG_FILE")
-    
     jq --arg tag "$TARGET_TAG" 'del(.inbounds[] | select(.tag == $tag))' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
     
     sed -i "/${TARGET_TAG}_PUBLIC_KEY=/d" "$ENV_FILE"
@@ -546,98 +558,37 @@ delete_config() {
     read -p "按回车键返回..."
 }
 
-# 8. 🔥 全场景无缝、纯净卸载环境 + 终极脚本自毁
+# 8. 🔥 全场景无缝卸载
 purge_uninstall() {
     clear
     echo -e "${RED}=================================================="
     echo -e "       ⚠️ 警告：您正在调用深度强制卸载程序 ⚠️"
     echo -e "=================================================="
-    echo -e " 本操作将破坏性擦除以下资产，绝不残留：${NC}"
-    echo -e " 1. 彻底杀死并解绑 sing-box 核心进程与系统守护服务"
-    echo -e " 2. 彻底抹除核心配置目录及全部节点参数 (/etc/sing-box)"
-    echo -e " 3. 清理 SkyVault Drive 前端伪装网站及页面源码"
-    echo -e " 4. 彻底注销并粉碎 acme.sh 环境及 Cron 自动化定时续签任务"
-    echo -e " 5. 抹除本地系统全局的 'sk' 快捷呼出软链接"
-    echo -e " 6. 彻底粉碎本 VPS 本地存储的脚本自身文件"
-    echo -e " 7. 💡 可选：彻底铲除 Nginx 核心及其系统依赖组件"
-    echo -e "${RED}==================================================${NC}"
     read -p "确认要将环境卸载得一干二净吗？请输入 (y/n): " PURGE_CONFIRM
-    
-    if [ "$PURGE_CONFIRM" != "y" ]; then
-        echo -e "${GREEN}卸载已取消。环境依然安全。${NC}"
-        read -p "按回车键返回..."
-        return
-    fi
+    if [ "$PURGE_CONFIRM" != "y" ]; then return; fi
 
-    read -p "是否同时彻底卸载 Nginx 核心组件及其全部系统依赖？(y/n): " PURGE_NGINX_CONFIRM
-
-    echo -e "${YELLOW}[*] 正在执行全套清场轰炸...${NC}"
-    source "$ENV_FILE" 2>/dev/null
+    read -p "是否同时彻底卸载 Nginx 核心组件？(y/n): " PURGE_NGINX_CONFIRM
 
     systemctl stop sing-box &>/dev/null
     systemctl disable sing-box &>/dev/null
-    rm -f /etc/systemd/system/sing-box.service
-    rm -f /usr/local/bin/sing-box
-    systemctl daemon-reload
-    echo -e "${GREEN}✔ sing-box 核心二进制及系统守护服务已注销。${NC}"
+    rm -f /etc/systemd/system/sing-box.service /usr/local/bin/sing-box
+    rm -rf /etc/sing-box /var/www/skyvault-drive
 
-    rm -rf /etc/sing-box
-    echo -e "${GREEN}✔ 节点核心配置文件夹已彻底抹除。${NC}"
-
-    rm -rf /var/www/skyvault-drive
-    
     if [ "$PURGE_NGINX_CONFIRM" = "y" ]; then
-        echo -e "${YELLOW}[*] 正在拔除 Nginx 服务及依赖残余...${NC}"
         systemctl stop nginx &>/dev/null
-        systemctl disable nginx &>/dev/null
         apt-get purge -y nginx nginx-common nginx-core &>/dev/null
         apt-get autoremove -y &>/dev/null
-        rm -rf /etc/nginx /var/log/nginx /var/www/html
-        echo -e "${GREEN}✔ Nginx 核心环境已完全从系统中剔除。${NC}"
-    else
-        mkdir -p /etc/nginx/sites-available
-        cat << EOF > /etc/nginx/sites-available/default
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    root /var/www/html;
-    index index.html index.htm;
-    server_name _;
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-}
-EOF
-        systemctl restart nginx &>/dev/null
-        echo -e "${GREEN}✔ Nginx 规则已还原回系统纯净初始状态。${NC}"
+        rm -rf /etc/nginx /var/log/nginx
     fi
 
     if [ -f "$HOME/.acme.sh/acme.sh" ]; then
-        echo -e "${YELLOW}[*] 正在注销域名证书并解除系统 Crontab 定时任务...${NC}"
-        if [ -n "$MY_DOMAIN" ]; then
-            ~/.acme.sh/acme.sh --remove -d "$MY_DOMAIN" --ecc &>/dev/null
-        fi
         ~/.acme.sh/acme.sh --uninstall &>/dev/null
         rm -rf "$HOME/.acme.sh"
-        echo -e "${GREEN}✔ SSL 证书链与自动化定时任务已干净剔除。${NC}"
     fi
 
-    rm -f sing-box.tar.gz
     rm -f /usr/local/bin/sk
-    sed -i '/alias sk=/d' ~/.bashrc
-    
-    echo -e "${YELLOW}[*] 正在触发内核自毁，抹除脚本残留...${NC}"
-    rm -f "/root/skybox.sh"
-    rm -f "$0" 
-    
-    echo -e "${GREEN}=================================================="
-    echo -e "🎉 净空完成！所有组件、配置、证书、定时任务、脚本文件已化为飞灰。"
-    if [ "$PURGE_NGINX_CONFIRM" = "y" ]; then
-        echo -e "连同 Nginx 也一起卷铺盖走人了！"
-    fi
-    echo -e "提示：快捷系统已彻底卸载注销。"
-    echo -e "${BLUE}==================================================${NC}"
-    
+    rm -f "$0"
+    echo -e "${GREEN}环境已完全彻底清空自毁！${NC}"
     exit 0
 }
 
@@ -670,6 +621,6 @@ while true; do
         7) delete_config ;;
         8) purge_uninstall ;;
         0) clear; exit 0 ;;
-        *) echo -e "${RED}输入错误，请输入 0 到 8 的有效命令数字！${NC}" && sleep 1 ;;
+        *) echo -e "${RED}输入错误！${NC}" && sleep 1 ;;
     esac
 done
