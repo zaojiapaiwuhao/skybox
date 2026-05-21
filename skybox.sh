@@ -649,7 +649,6 @@ while true; do
     echo -e "        SkyVault Drive 核心高级交互式菜单"
     echo -e "=================================================="
     echo -e " ${GREEN}1)${NC} 安装 / 更新 sing-box 核心环境 (带版本智能校验)"
-    echo -e " ${GREEN}1)${NC} 安装 / 更新 sing-box 核心环境 (带版本智能校验)"
     echo -e " ${GREEN}2)${NC} 添加 Shadowsocks 2022 节点 (多加密可选)"
     echo -e " ${GREEN}3)${NC} 部署 / 更新 SkyVault Drive 伪装网站 (全自动SSL)"
     echo -e " ${GREEN}4)${NC} 添加 VLESS-REALITY 节点 (自偷混淆模式)"
@@ -658,7 +657,7 @@ while true; do
     echo -e " ${PURPLE}7) 删除指定不需要的代理节点${NC}"
     echo -e " ${RED}8) 🚨 一键彻底卸载面板、环境、定时任务、Nginx与脚本自毁 (干净利落)${NC}"
     echo -e " ${PLAIN}0) 优雅安全退出脚本${NC}"
-    echo -e "${BLUE}=================================================="
+    echo -e "${BLUE}==================================================${NC}"
     read -p "请选择操作 [0-8]: " CHOICE
 
     case $CHOICE in
