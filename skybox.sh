@@ -3,12 +3,14 @@
 # ==========================================================
 # SkyVault Drive + sing-box 高级交互式管理脚本
 #
-# 架构：
+# 设计逻辑：
+# - 启动脚本时，只安装最基础依赖，不碰 Nginx
+# - 选择 1/2 时，只处理 sing-box / Shadowsocks
+# - 只有选择 3 部署伪装网站时，才安装/修复 Nginx 环境
 # - sing-box 从 GitHub Release 拉取安装
 # - Nginx 监听 80，用于 acme.sh webroot 续签
 # - Nginx 监听 127.0.0.1:8443 ssl，用于 Reality 自偷
 # - VLESS-REALITY 监听公网 443
-# - Reality handshake 转发到 127.0.0.1:8443
 # ==========================================================
 
 RED='\033[0;31m'
@@ -25,6 +27,8 @@ ENV_FILE="/etc/sing-box/script_env.sh"
 WEB_ROOT="/var/www/skyvault-drive"
 NGINX_SITE="/etc/nginx/sites-available/skyvault"
 NGINX_LINK="/etc/nginx/sites-enabled/skyvault"
+
+SCRIPT_PATH="$(realpath "$0" 2>/dev/null || echo "$0")"
 
 # ==========================================================
 # root 检查
@@ -49,7 +53,6 @@ get_public_ip() {
     curl -fsS4 https://api.ipify.org 2>/dev/null || curl -fsS4 https://icanhazip.com 2>/dev/null
 }
 
-# 更稳的 IPv4 DNS 查询函数：dig -> getent -> nslookup
 resolve_domain_ipv4() {
     local domain="$1"
     local result=""
@@ -137,12 +140,34 @@ EOF
     fi
 }
 
+backup_config() {
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%s)"
+}
+
+latest_backup_file() {
+    ls -t "${CONFIG_FILE}".bak.* 2>/dev/null | head -n 1
+}
+
+check_singbox_config() {
+    if ! command -v sing-box >/dev/null 2>&1; then
+        echo -e "${RED}sing-box 未安装。${NC}"
+        return 1
+    fi
+
+    sing-box check -c "$CONFIG_FILE" >/tmp/singbox_check.log 2>&1
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}sing-box 配置检查失败：${NC}"
+        cat /tmp/singbox_check.log
+        return 1
+    fi
+
+    return 0
+}
+
 # ==========================================================
 # Nginx 核心配置自愈
-# 修复：
-# - /etc/nginx/nginx.conf 丢失
-# - /etc/nginx/mime.types 丢失
-# - 基础目录丢失
+# 注意：这个函数不会在脚本启动时执行。
+# 只有选择第 3 步部署网站时才执行。
 # ==========================================================
 ensure_nginx_core_config() {
     mkdir -p /etc/nginx
@@ -280,32 +305,11 @@ EOF
     fi
 }
 
-backup_config() {
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%s)"
-}
-
-latest_backup_file() {
-    ls -t "${CONFIG_FILE}".bak.* 2>/dev/null | head -n 1
-}
-
-check_singbox_config() {
-    if ! command -v sing-box >/dev/null 2>&1; then
-        echo -e "${RED}sing-box 未安装。${NC}"
-        return 1
-    fi
-
-    sing-box check -c "$CONFIG_FILE" >/tmp/singbox_check.log 2>&1
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}sing-box 配置检查失败：${NC}"
-        cat /tmp/singbox_check.log
-        return 1
-    fi
-
-    return 0
-}
-
 # ==========================================================
-# 初始化环境
+# 基础环境初始化
+# 注意：
+# 这里不安装 Nginx。
+# 这里只安装 sing-box / SS2022 / 菜单所需基础依赖。
 # ==========================================================
 init_env() {
     mkdir -p "$CONFIG_DIR"
@@ -317,19 +321,14 @@ init_env() {
 
     local need_install=0
 
-    for cmd in jq curl wget openssl socat nginx fuser; do
+    for cmd in jq curl wget openssl; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             need_install=1
         fi
     done
 
-    # dig 不存在时尝试安装，但 DNS 检测仍然有 getent/nslookup 备用方案
-    if ! command -v dig >/dev/null 2>&1; then
-        need_install=1
-    fi
-
     if [ "$need_install" -eq 1 ]; then
-        echo -e "${YELLOW}正在安装基础依赖：jq curl wget openssl socat nginx dnsutils cron psmisc...${NC}"
+        echo -e "${YELLOW}正在安装基础依赖：jq curl wget openssl ca-certificates...${NC}"
 
         if ! apt-get update -y; then
             echo -e "${RED}apt update 失败。${NC}"
@@ -337,7 +336,45 @@ init_env() {
             return 1
         fi
 
-        apt-get install -y jq curl wget openssl socat nginx unzip cron psmisc ca-certificates dnsutils
+        apt-get install -y jq curl wget openssl ca-certificates
+    fi
+
+    ensure_json
+
+    if [ ! -f /usr/local/bin/sk ]; then
+        ln -sf "$(realpath "$0")" /usr/local/bin/sk 2>/dev/null
+        chmod +x /usr/local/bin/sk 2>/dev/null
+    fi
+
+    return 0
+}
+
+# ==========================================================
+# 网站/证书环境初始化
+# 只有选择第 3 步时才执行
+# ==========================================================
+init_website_env() {
+    local need_install=0
+
+    for cmd in nginx socat fuser; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            need_install=1
+        fi
+    done
+
+    if ! command -v dig >/dev/null 2>&1; then
+        need_install=1
+    fi
+
+    if [ "$need_install" -eq 1 ]; then
+        echo -e "${YELLOW}正在安装网站/证书相关依赖：nginx socat dnsutils psmisc...${NC}"
+
+        if ! apt-get update -y; then
+            echo -e "${RED}apt update 失败，请检查系统软件源。${NC}"
+            return 1
+        fi
+
+        apt-get install -y nginx socat psmisc dnsutils ca-certificates
 
         if ! command -v dig >/dev/null 2>&1; then
             apt-get install -y bind9-dnsutils
@@ -351,13 +388,6 @@ init_env() {
     ensure_nginx_core_config
 
     systemctl enable nginx >/dev/null 2>&1
-
-    ensure_json
-
-    if [ ! -f /usr/local/bin/sk ]; then
-        ln -sf "$(realpath "$0")" /usr/local/bin/sk 2>/dev/null
-        chmod +x /usr/local/bin/sk 2>/dev/null
-    fi
 
     return 0
 }
@@ -580,6 +610,12 @@ deploy_website() {
     clear
     echo -e "${BLUE}[3] 部署 / 更新 SkyVault Drive 伪装网站 + SSL${NC}"
 
+    if ! init_website_env; then
+        echo -e "${RED}网站/证书环境初始化失败。${NC}"
+        pause
+        return
+    fi
+
     read -p "请输入绑定域名，例如 drive.example.com: " DOMAIN
     if [ -z "$DOMAIN" ]; then
         echo -e "${RED}域名不能为空。${NC}"
@@ -712,7 +748,6 @@ deploy_website() {
 </html>
 EOF
 
-    # 先写 HTTP 配置，用于 webroot 签发和后续续签
     cat > "$NGINX_SITE" <<EOF
 server {
     listen 80;
@@ -765,9 +800,6 @@ EOF
         --fullchain-file "/etc/nginx/ssl/$DOMAIN/fullchain.cer" \
         --reloadcmd "systemctl reload nginx"
 
-    # 最终配置：
-    # 80：用于 acme.sh 后续 webroot 续签
-    # 127.0.0.1:8443：用于 Reality 自偷 handshake
     cat > "$NGINX_SITE" <<EOF
 server {
     listen 80;
@@ -1160,49 +1192,150 @@ delete_config() {
 }
 
 # ==========================================================
-# 8. 卸载
+# 8. 一键彻底卸载
 # ==========================================================
 purge_uninstall() {
     clear
     echo -e "${RED}=================================================="
-    echo -e "       危险：即将卸载 sing-box、脚本配置、伪装网站"
+    echo -e "       危险：即将彻底卸载所有相关环境"
     echo -e "==================================================${NC}"
+    echo -e "${YELLOW}将删除以下内容：${NC}"
+    echo " - sing-box 核心、服务、配置、日志、运行目录"
+    echo " - Shadowsocks / VLESS-Reality 节点配置"
+    echo " - SkyVault Drive 伪装网站目录"
+    echo " - Nginx 及其所有配置、日志、缓存、运行目录"
+    echo " - acme.sh 证书工具、证书、账号数据"
+    echo " - acme.sh 自动续订 cron / systemd timer 残留"
+    echo " - /usr/local/bin/sk 快捷命令"
+    echo " - 当前脚本文件本身"
+    echo
 
-    read -p "确认卸载？(y/n): " CONFIRM
-    [ "$CONFIRM" != "y" ] && return
+    read -p "确认彻底卸载？输入 y 确认，其他任意键取消: " CONFIRM
+    if [ "$CONFIRM" != "y" ]; then
+        echo -e "${YELLOW}已取消卸载。${NC}"
+        pause
+        return
+    fi
 
-    read -p "是否同时卸载 Nginx？(y/n): " REMOVE_NGINX
-    read -p "是否同时卸载 acme.sh 证书工具？(y/n): " REMOVE_ACME
+    echo -e "${YELLOW}正在停止相关服务和进程...${NC}"
 
     systemctl stop sing-box >/dev/null 2>&1
     systemctl disable sing-box >/dev/null 2>&1
+    systemctl stop nginx >/dev/null 2>&1
+    systemctl disable nginx >/dev/null 2>&1
+
+    pkill -f "sing-box" >/dev/null 2>&1
+    pkill -f "nginx" >/dev/null 2>&1
+    pkill -f "acme.sh" >/dev/null 2>&1
+
+    echo -e "${YELLOW}正在删除 sing-box 核心、服务、配置、日志...${NC}"
 
     rm -f /etc/systemd/system/sing-box.service
+    rm -f /usr/lib/systemd/system/sing-box.service
+    rm -f /lib/systemd/system/sing-box.service
+    rm -f /etc/systemd/system/multi-user.target.wants/sing-box.service
+
     rm -f /usr/local/bin/sing-box
-    rm -rf "$CONFIG_DIR"
+    rm -f /usr/bin/sing-box
+
+    rm -rf /etc/sing-box
+    rm -rf /var/lib/sing-box
+    rm -rf /var/log/sing-box
+    rm -rf /run/sing-box
+    rm -rf /tmp/sing-box*
+    rm -rf /tmp/singbox*
+
+    if command -v dpkg >/dev/null 2>&1; then
+        if dpkg -l 2>/dev/null | grep -qE '^ii\s+sing-box'; then
+            apt-get purge -y sing-box >/dev/null 2>&1
+            apt-get autoremove -y >/dev/null 2>&1
+        fi
+    fi
+
+    echo -e "${YELLOW}正在删除 SkyVault Drive 网站目录...${NC}"
+
     rm -rf "$WEB_ROOT"
-    rm -f "$NGINX_SITE" "$NGINX_LINK"
+    rm -rf /var/www/skyvault-drive
+    rm -rf /var/www/skyvault
+
+    echo -e "${YELLOW}正在删除 Nginx 站点配置与 SSL 证书目录...${NC}"
+
+    rm -f "$NGINX_SITE"
+    rm -f "$NGINX_LINK"
+    rm -f /etc/nginx/sites-available/skyvault
+    rm -f /etc/nginx/sites-enabled/skyvault
+    rm -f /etc/nginx/sites-available/default
+    rm -f /etc/nginx/sites-enabled/default
+
+    rm -rf /etc/nginx/ssl
+
+    echo -e "${YELLOW}正在卸载 Nginx 并清理残留...${NC}"
+
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get purge -y nginx nginx-common nginx-core nginx-full nginx-light >/dev/null 2>&1
+        apt-get autoremove -y >/dev/null 2>&1
+    fi
+
+    rm -rf /etc/nginx
+    rm -rf /var/log/nginx
+    rm -rf /var/cache/nginx
+    rm -rf /var/lib/nginx
+    rm -rf /run/nginx
+    rm -f /run/nginx.pid
+
+    echo -e "${YELLOW}正在卸载 acme.sh、证书、账号数据、续订任务...${NC}"
+
+    if [ -f "$HOME/.acme.sh/acme.sh" ]; then
+        "$HOME/.acme.sh/acme.sh" --uninstall >/dev/null 2>&1
+    fi
+
+    rm -rf "$HOME/.acme.sh"
+    rm -rf /root/.acme.sh
+
+    if command -v crontab >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -v 'acme.sh' | grep -v '.acme.sh' | crontab - 2>/dev/null
+    fi
+
+    rm -f /etc/cron.d/acme.sh
+    rm -f /etc/cron.daily/acme.sh
+    rm -f /etc/cron.hourly/acme.sh
+    rm -f /etc/cron.weekly/acme.sh
+    rm -f /etc/cron.monthly/acme.sh
+
+    systemctl stop acme.sh.timer >/dev/null 2>&1
+    systemctl disable acme.sh.timer >/dev/null 2>&1
+    systemctl stop acme.sh.service >/dev/null 2>&1
+    systemctl disable acme.sh.service >/dev/null 2>&1
+
+    rm -f /etc/systemd/system/acme.sh.timer
+    rm -f /etc/systemd/system/acme.sh.service
+    rm -f /usr/lib/systemd/system/acme.sh.timer
+    rm -f /usr/lib/systemd/system/acme.sh.service
+    rm -f /lib/systemd/system/acme.sh.timer
+    rm -f /lib/systemd/system/acme.sh.service
+
+    echo -e "${YELLOW}正在清理脚本快捷命令和自身文件...${NC}"
+
     rm -f /usr/local/bin/sk
 
-    systemctl daemon-reload
-
-    if [ "$REMOVE_ACME" = "y" ]; then
-        if [ -f "$HOME/.acme.sh/acme.sh" ]; then
-            "$HOME/.acme.sh/acme.sh" --uninstall >/dev/null 2>&1
-        fi
-        rm -rf "$HOME/.acme.sh"
+    if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
+        rm -f "$SCRIPT_PATH"
     fi
 
-    if [ "$REMOVE_NGINX" = "y" ]; then
-        systemctl stop nginx >/dev/null 2>&1
-        apt-get purge -y nginx nginx-common nginx-core >/dev/null 2>&1
-        apt-get autoremove -y >/dev/null 2>&1
-        rm -rf /etc/nginx /var/log/nginx
-    else
-        systemctl restart nginx >/dev/null 2>&1
-    fi
+    rm -f /root/skybox.sh
+    rm -f /root/sk.sh
+    rm -f /root/singbox.sh
+    rm -f /root/sing-box.sh
+    rm -f /root/sb.sh
 
-    echo -e "${GREEN}卸载完成。${NC}"
+    echo -e "${YELLOW}正在刷新 systemd 状态...${NC}"
+
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl reset-failed >/dev/null 2>&1
+
+    echo -e "${GREEN}所有相关环境已彻底卸载。${NC}"
+    echo -e "${GREEN}sing-box 配置、Nginx、证书、自动续订任务、脚本本体均已清理。${NC}"
+
     exit 0
 }
 
@@ -1227,7 +1360,7 @@ while true; do
     echo -e " ${YELLOW}5)${NC} 查看节点配置与分享链接"
     echo -e " ${BLUE}6)${NC} 修改现有节点"
     echo -e " ${PURPLE}7)${NC} 删除节点"
-    echo -e " ${RED}8)${NC} 卸载环境"
+    echo -e " ${RED}8)${NC} 一键彻底卸载所有环境并删除脚本"
     echo -e " 0) 退出"
     echo -e "${BLUE}==================================================${NC}"
 
