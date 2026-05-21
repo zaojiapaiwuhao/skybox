@@ -2,11 +2,13 @@
 
 # ==========================================================
 # SkyVault Drive + sing-box 高级交互式管理脚本
+#
 # 架构：
 # - sing-box 从 GitHub Release 拉取安装
-# - Nginx 仅监听 80 和 127.0.0.1:8443
+# - Nginx 监听 80，用于 acme.sh webroot 续签
+# - Nginx 监听 127.0.0.1:8443 ssl，用于 Reality 自偷
 # - VLESS-REALITY 监听公网 443
-# - Reality handshake 转发到 127.0.0.1:8443，自偷自己的伪装网站
+# - Reality handshake 转发到 127.0.0.1:8443
 # ==========================================================
 
 RED='\033[0;31m'
@@ -135,6 +137,149 @@ EOF
     fi
 }
 
+# ==========================================================
+# Nginx 核心配置自愈
+# 修复：
+# - /etc/nginx/nginx.conf 丢失
+# - /etc/nginx/mime.types 丢失
+# - 基础目录丢失
+# ==========================================================
+ensure_nginx_core_config() {
+    mkdir -p /etc/nginx
+    mkdir -p /etc/nginx/conf.d
+    mkdir -p /etc/nginx/sites-available
+    mkdir -p /etc/nginx/sites-enabled
+    mkdir -p /etc/nginx/modules-enabled
+    mkdir -p /var/log/nginx
+
+    if [ ! -f /etc/nginx/mime.types ]; then
+        echo -e "${YELLOW}检测到 /etc/nginx/mime.types 丢失，正在自动重建...${NC}"
+
+        cat > /etc/nginx/mime.types <<'EOF'
+types {
+    text/html                             html htm shtml;
+    text/css                              css;
+    text/xml                              xml;
+    image/gif                             gif;
+    image/jpeg                            jpeg jpg;
+    application/javascript                js;
+    application/atom+xml                  atom;
+    application/rss+xml                   rss;
+    text/mathml                           mml;
+    text/plain                            txt;
+    text/vnd.sun.j2me.app-descriptor      jad;
+    text/vnd.wap.wml                      wml;
+    text/x-component                      htc;
+
+    image/avif                            avif;
+    image/png                             png;
+    image/svg+xml                         svg svgz;
+    image/tiff                            tif tiff;
+    image/vnd.wap.wbmp                    wbmp;
+    image/webp                            webp;
+    image/x-icon                          ico;
+    image/x-jng                           jng;
+    image/x-ms-bmp                        bmp;
+
+    font/woff                             woff;
+    font/woff2                            woff2;
+
+    application/java-archive              jar war ear;
+    application/json                      json;
+    application/mac-binhex40              hqx;
+    application/msword                    doc;
+    application/pdf                       pdf;
+    application/postscript                ps eps ai;
+    application/rtf                       rtf;
+    application/vnd.ms-excel              xls;
+    application/vnd.ms-powerpoint         ppt;
+    application/vnd.wap.wmlc              wmlc;
+    application/vnd.google-earth.kml+xml  kml;
+    application/vnd.google-earth.kmz      kmz;
+    application/x-7z-compressed           7z;
+    application/x-cocoa                   cco;
+    application/x-java-archive-diff       jardiff;
+    application/x-java-jnlp-file          jnlp;
+    application/x-makeself                run;
+    application/x-perl                    pl pm;
+    application/x-pilot                   prc pdb;
+    application/x-rar-compressed          rar;
+    application/x-redhat-package-manager  rpm;
+    application/x-sea                     sea;
+    application/x-shockwave-flash         swf;
+    application/x-stuffit                 sit;
+    application/x-tcl                     tcl tk;
+    application/x-x509-ca-cert            der pem crt;
+    application/x-xpinstall               xpi;
+    application/xhtml+xml                 xhtml;
+    application/xspf+xml                  xspf;
+    application/zip                       zip;
+
+    application/octet-stream              bin exe dll;
+    application/octet-stream              deb;
+    application/octet-stream              dmg;
+    application/octet-stream              iso img;
+    application/octet-stream              msi msp msm;
+
+    audio/midi                            mid midi kar;
+    audio/mpeg                            mp3;
+    audio/ogg                             ogg;
+    audio/x-m4a                           m4a;
+    audio/x-realaudio                     ra;
+
+    video/3gpp                            3gpp 3gp;
+    video/mp2t                            ts;
+    video/mp4                             mp4;
+    video/mpeg                            mpeg mpg;
+    video/quicktime                       mov;
+    video/webm                            webm;
+    video/x-flv                           flv;
+    video/x-m4v                           m4v;
+    video/x-mng                           mng;
+    video/x-ms-asf                        asx asf;
+    video/x-ms-wmv                        wmv;
+    video/x-msvideo                       avi;
+}
+EOF
+    fi
+
+    if [ ! -f /etc/nginx/nginx.conf ]; then
+        echo -e "${YELLOW}检测到 /etc/nginx/nginx.conf 丢失，正在自动重建...${NC}"
+
+        cat > /etc/nginx/nginx.conf <<'EOF'
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+
+include /etc/nginx/modules-enabled/*.conf;
+
+events {
+    worker_connections 768;
+}
+
+http {
+    sendfile on;
+    tcp_nopush on;
+    types_hash_max_size 2048;
+
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    access_log /var/log/nginx/access.log;
+    error_log /var/log/nginx/error.log;
+
+    gzip on;
+
+    include /etc/nginx/conf.d/*.conf;
+    include /etc/nginx/sites-enabled/*;
+}
+EOF
+    fi
+}
+
 backup_config() {
     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%s)"
 }
@@ -194,7 +339,6 @@ init_env() {
 
         apt-get install -y jq curl wget openssl socat nginx unzip cron psmisc ca-certificates dnsutils
 
-        # 某些系统 dnsutils 包未提供 dig 时，再尝试 bind9-dnsutils
         if ! command -v dig >/dev/null 2>&1; then
             apt-get install -y bind9-dnsutils
         fi
@@ -204,7 +348,7 @@ init_env() {
         echo -e "${YELLOW}提示：dig 仍不可用，DNS 检测将使用 getent/nslookup 备用方式。${NC}"
     fi
 
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+    ensure_nginx_core_config
 
     systemctl enable nginx >/dev/null 2>&1
 
@@ -474,6 +618,8 @@ deploy_website() {
 
     mkdir -p "$WEB_ROOT/.well-known/acme-challenge"
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+
+    ensure_nginx_core_config
 
     cat > "$WEB_ROOT/index.html" <<'EOF'
 <!DOCTYPE html>
@@ -912,8 +1058,8 @@ modify_config() {
                 return
             fi
 
-            if jq -e --argjson port "$NEW_PORT" --argjson idx "$INDEX" '.inbounds[]? | select(.listen_port == $port) | select(. != .inbounds[$idx])' "$CONFIG_FILE" >/dev/null 2>&1; then
-                echo -e "${RED}端口可能已被占用，请换一个。${NC}"
+            if jq -e --argjson port "$NEW_PORT" --argjson idx "$INDEX" '.inbounds | to_entries[] | select(.key != $idx and .value.listen_port == $port)' "$CONFIG_FILE" >/dev/null 2>&1; then
+                echo -e "${RED}端口已被其他节点占用。${NC}"
                 pause
                 return
             fi
@@ -1026,6 +1172,7 @@ purge_uninstall() {
     [ "$CONFIRM" != "y" ] && return
 
     read -p "是否同时卸载 Nginx？(y/n): " REMOVE_NGINX
+    read -p "是否同时卸载 acme.sh 证书工具？(y/n): " REMOVE_ACME
 
     systemctl stop sing-box >/dev/null 2>&1
     systemctl disable sing-box >/dev/null 2>&1
@@ -1038,6 +1185,13 @@ purge_uninstall() {
     rm -f /usr/local/bin/sk
 
     systemctl daemon-reload
+
+    if [ "$REMOVE_ACME" = "y" ]; then
+        if [ -f "$HOME/.acme.sh/acme.sh" ]; then
+            "$HOME/.acme.sh/acme.sh" --uninstall >/dev/null 2>&1
+        fi
+        rm -rf "$HOME/.acme.sh"
+    fi
 
     if [ "$REMOVE_NGINX" = "y" ]; then
         systemctl stop nginx >/dev/null 2>&1
