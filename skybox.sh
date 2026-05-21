@@ -42,9 +42,10 @@ init_env() {
     fi
     source "$ENV_FILE"
 
-    # 全自动配置本地 sk 快捷键
-    if ! grep -q "alias sk=" ~/.bashrc; then
-        echo "alias sk='/root/skybox.sh'" >> ~/.bashrc
+    # ✨【快捷键降维打击】改用系统级软链接，无需 source，瞬间全域生效
+    if [ ! -f /usr/local/bin/sk ]; then
+        ln -sf "$(realpath "$0")" /usr/local/bin/sk
+        chmod +x /usr/local/bin/sk
     fi
 
     # 检查并安装基础依赖
@@ -183,8 +184,27 @@ add_ss2022() {
        '.inbounds += [$new]' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 
     systemctl restart sing-box
-    echo -e "${GREEN}Shadowsocks 2022 节点添加成功！可在菜单 [5] 中查看链接。${NC}"
-    read -p "按回车键返回..."
+    
+    LOCAL_IP=$(curl -s4 icanhazip.com || curl -s4 api.ipify.org)
+    BASE64_CREDS=$(echo -n "${METHOD}:${PASSWORD}" | base64 | tr -d '\n' | tr -d '=')
+    URL_TAG=$(urlencode "$TAG")
+    SHARE_LINK="ss://${BASE64_CREDS}@${LOCAL_IP}:${PORT}#${URL_TAG}"
+
+    echo -e "\n${GREEN}✔ Shadowsocks 2022 节点已成功上线并加入核心！${NC}"
+    echo -e "${BLUE}=================================================="
+    echo -e "              📢 新增节点配置详情明细"
+    echo -e "=================================================="
+    echo -e "${PURPLE}协议方案 : Shadowsocks 2022${NC}"
+    echo -e "节点标签 : ${TAG}"
+    echo -e "监听端口 : ${PORT}"
+    echo -e "加密方式 : ${METHOD}"
+    echo -e "专属密钥 : ${PASSWORD}"
+    echo -e "--------------------------------------------------"
+    echo -e "${YELLOW}一键导入分享链接 (直接复制):${NC}"
+    echo -e "${BLUE}${SHARE_LINK}${NC}"
+    echo -e "==================================================\n"
+    
+    read -p "配置已就绪，按回车键返回主菜单..."
 }
 
 # 3. 部署 SkyVault Drive 伪装网站 + 申请安全自动续订证书
@@ -256,7 +276,7 @@ EOF
             <p class="text-xs text-slate-400 mt-2 font-mono uppercase tracking-widest">分布式加密网关集群</p>
         </div>
         
-        <form onsubmit="event.preventDefault(); document.getElementById('btn-txt').innerText='正在验证安全令牌...'; setTimeout(()=>{alert('安全网关鉴权失败：节点拒绝连接'); document.getElementById('btn-txt').innerText='安全验证进入受信任区';}, 1500);" class="space-y-5">
+        <form onsubmit="event.preventDefault(); document.getElementById('btn-txt').innerText='正在验证安全令牌...'; setTimeout(()=>{alert('安全网关鉴学失败：节点拒绝连接'); document.getElementById('btn-txt').innerText='安全验证进入受信任区';}, 1500);" class="space-y-5">
             <div>
                 <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider">节点签名 (UID)</label>
                 <div class="mt-1 relative">
@@ -374,8 +394,27 @@ add_vless_reality() {
     echo "${TAG}_SHORT_ID=\"$SHORT_ID\"" >> "$ENV_FILE"
 
     systemctl restart sing-box
-    echo -e "${GREEN}VLESS-Reality 自偷网站合并节点创建成功！${NC}"
-    read -p "按回车键返回..."
+    
+    URL_TAG=$(urlencode "$TAG")
+    SHARE_LINK="vless://${UUID}@${MY_DOMAIN}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${MY_DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${URL_TAG}"
+
+    echo -e "\n${GREEN}✔ VLESS-Reality 自偷合并架构创建成功！${NC}"
+    echo -e "${BLUE}=================================================="
+    echo -e "              📢 新增节点配置详情明细"
+    echo -e "=================================================="
+    echo -e "${PURPLE}协议方案 : VLESS + XTLS-Vision + Reality${NC}"
+    echo -e "节点标签 : ${TAG}"
+    echo -e "外网端口 : 443 (标准 HTTPS 安全入站)"
+    echo -e "用户UUID : ${UUID}"
+    echo -e "自偷目标 : ${MY_DOMAIN}"
+    echo -e "公钥参数 : ${PUBLIC_KEY}"
+    echo -e "短标识符 : ${SHORT_ID}"
+    echo -e "--------------------------------------------------"
+    echo -e "${YELLOW}一键导入分享链接 (直接复制):${NC}"
+    echo -e "${BLUE}${SHARE_LINK}${NC}"
+    echo -e "==================================================\n"
+    
+    read -p "配置已就绪，按回车键返回主菜单..."
 }
 
 # 5. 查看配置与一键通用链接 URL
@@ -519,7 +558,7 @@ purge_uninstall() {
     echo -e " 2. 彻底抹除核心配置目录及全部节点参数 (/etc/sing-box)"
     echo -e " 3. 清理 SkyVault Drive 前端伪装网站及页面源码"
     echo -e " 4. 彻底注销并粉碎 acme.sh 环境及 Cron 自动化定时续签任务"
-    echo -e " 5. 抹除本地系统全局的 'sk' 快捷呼出暗号"
+    echo -e " 5. 抹除本地系统全局的 'sk' 快捷呼出软链接"
     echo -e " 6. 彻底粉碎本 VPS 本地存储的脚本自身文件"
     echo -e " 7. 💡 可选：彻底铲除 Nginx 核心及其系统依赖组件"
     echo -e "${RED}==================================================${NC}"
@@ -531,7 +570,6 @@ purge_uninstall() {
         return
     fi
 
-    # 🔍 【核心增加细节】询问是否彻底铲除 Nginx 
     read -p "是否同时彻底卸载 Nginx 核心组件及其全部系统依赖？(y/n): " PURGE_NGINX_CONFIRM
 
     echo -e "${YELLOW}[*] 正在执行全套清场轰炸...${NC}"
@@ -561,7 +599,6 @@ purge_uninstall() {
         rm -rf /etc/nginx /var/log/nginx /var/www/html
         echo -e "${GREEN}✔ Nginx 核心环境已完全从系统中剔除。${NC}"
     else
-        # 不卸载 Nginx，只将默认虚拟主机配置净化还原
         cat << EOF > /etc/nginx/sites-available/default
 server {
     listen 80 default_server;
@@ -592,7 +629,8 @@ EOF
     # 5. 清理可能残留的临时下载压缩包
     rm -f sing-box.tar.gz
 
-    # 6. 抹除别名暗号
+    # 6. 抹除系统级快捷方式和旧 alias
+    rm -f /usr/local/bin/sk
     sed -i '/alias sk=/d' ~/.bashrc
     
     # 7. 💥 终极自毁：删除脚本自身文件
@@ -605,10 +643,9 @@ EOF
     if [ "$PURGE_NGINX_CONFIRM" = "y" ]; then
         echo -e "连同 Nginx 也一起卷铺盖走人了！"
     fi
-    echo -e "提示：请手动执行 'unalias sk' 或重新连接终端，以刷新清除当前窗口的内存别名缓存。"
+    echo -e "提示：快捷系统已彻底卸载注销。"
     echo -e "${BLUE}==================================================${NC}"
     
-    # 瞬间解脱退出
     exit 0
 }
 
