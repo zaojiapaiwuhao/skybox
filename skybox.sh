@@ -669,7 +669,7 @@ while true; do
         6) modify_config ;;
         7) delete_config ;;
         8) purge_uninstall ;;
-        0; clear; exit 0 ;;
+        0) clear; exit 0 ;;
         *) echo -e "${RED}输入错误，请输入 0 到 8 的有效命令数字！${NC}" && sleep 1 ;;
     esac
 done
