@@ -57,20 +57,50 @@ init_env() {
     fi
 }
 
-# 1. 安装/更新 sing-box
+# 1. 极其稳健的安装/更新 sing-box 核心函数
 install_singbox() {
     echo -e "${BLUE}[1] 开始安装/更新 sing-box 核心...${NC}"
-    bash <(curl -fsSL https://sing-box.app/deb.sh)
     
-    if [ $? -ne 0 ]; then
-        echo -e "${YELLOW}官方 APT 源连接超时，正在切换至 GitHub 备用生产线...${NC}"
-        LATEST_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
-        wget -O sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-linux-amd64.tar.gz"
-        tar -zxvf sing-box.tar.gz
-        mv sing-box-*/sing-box /usr/local/bin/
-        rm -rf sing-box*
+    # 策略 A：尝试使用最新的官方官方 APT 源方式安装
+    echo -e "${YELLOW}正在尝试通过官方 APT 源同步...${NC}"
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sing-box.asc 2>/dev/null
+    
+    if [ $? -eq 0 ] && [ -f /etc/apt/keyrings/sing-box.asc ]; then
+        echo "deb [signed-by=/etc/apt/keyrings/sing-box.asc] https://deb.sing-box.app/ main" > /etc/apt/sources.list.d/sing-box.list
+        apt-get update -y && apt-get install -y sing-box
+    fi
+
+    # 策略 B：如果系统依然找不到 sing-box 命令，说明 APT 路线断了，立刻触发 GitHub 备用纯净线
+    if ! command -v sing-box &> /dev/null; then
+        echo -e "${YELLOW}官方 APT 源未能成功安装，正在切换至 GitHub 备用生产线直拉预编译二进制...${NC}"
         
-        cat <<EOF > /etc/systemd/system/sing-box.service
+        # 智能架构识别
+        ARCH=$(uname -m)
+        case "$ARCH" in
+            x86_64)  SINGBOX_ARCH="linux-amd64" ;;
+            aarch64) SINGBOX_ARCH="linux-arm64" ;;
+            armv7l)  SINGBOX_ARCH="linux-armv7" ;;
+            *)       SINGBOX_ARCH="linux-amd64" ;;
+        esac
+        
+        # 获取最新 Release 版本号
+        LATEST_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
+        if [ -z "$LATEST_VER" ] || [ "$LATEST_VER" = "null" ]; then
+            LATEST_VER="1.11.2" # 极度恶劣网络下的保底版本号
+        fi
+        
+        echo -e "${BLUE}目标拉取版本: v${LATEST_VER} (${SINGBOX_ARCH})${NC}"
+        wget -O sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-${SINGBOX_ARCH}.tar.gz"
+        
+        if [ -f sing-box.tar.gz ] && [ -s sing-box.tar.gz ]; then
+            tar -zxvf sing-box.tar.gz
+            mv sing-box-*/sing-box /usr/local/bin/
+            rm -rf sing-box*
+            chmod +x /usr/local/bin/sing-box
+            
+            # 为手动下载的二进制建立标准的 Systemd 进程守护守护服务
+            cat <<EOF > /etc/systemd/system/sing-box.service
 [Unit]
 Description=sing-box service
 After=network.target nss-lookup.target
@@ -85,11 +115,19 @@ RestartSec=10s
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
+        else
+            echo -e "${RED}错误：GitHub 备用下载线依然被本地防火墙或网络拦截，请检查代理环境！${NC}"
+            read -p "按回车键返回..."
+            return
+        fi
     fi
+    
+    # 刷新服务并唤醒核心
+    systemctl daemon-reload
     systemctl enable sing-box
     systemctl restart sing-box
-    echo -e "${GREEN}sing-box 部署完成！当前运行状态：$(systemctl is-active sing-box)${NC}"
+    
+    echo -e "${GREEN}sing-box 部署完成！当前实际运行状态：$(systemctl is-active sing-box)${NC}"
     read -p "按回车键返回..."
 }
 
@@ -182,7 +220,7 @@ EOF
         return
     fi
 
-    # 渲染高度逼真的 SkyVault Drive 暗黑科技风前端伪装页
+    # 渲染高度逼真暗黑科技风前端伪装页
     cat << 'EOF' > /var/www/skyvault-drive/index.html
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -379,7 +417,7 @@ view_configs() {
             echo -e "--------------------------------------------------"
         done
     fi
-    read -p "按回车键返回主菜单..."
+    read -p "按回车键返回..."
 }
 
 # 6. 更改配置
