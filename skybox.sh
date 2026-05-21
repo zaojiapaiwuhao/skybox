@@ -62,9 +62,32 @@ init_env() {
     fi
 }
 
-# 1. 纯净流：智能识别架构，直拉 GitHub 预编译二进制文件
+# 1. 纯净流：智能版本校验 + 架构识别部署
 install_singbox() {
-    echo -e "${BLUE}[1] 开始安装/更新 sing-box 核心...${NC}"
+    echo -e "${BLUE}[1] 开始检查 sing-box 核心环境...${NC}"
+    
+    # 获取 GitHub 最新稳定版版本号
+    echo -e "${YELLOW}正在检索 GitHub 最新 Release 版本...${NC}"
+    LATEST_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
+    if [ -z "$LATEST_VER" ] || [ "$LATEST_VER" = "null" ]; then
+        LATEST_VER="1.11.2" # 生产保底版本
+    fi
+    
+    # 🔍 【新增】本地版本校验逻辑
+    if command -v sing-box &> /dev/null; then
+        LOCAL_VER=$(sing-box version 2>&1 | head -n 1 | awk '{print $3}')
+        echo -e "${GREEN}当前本地已安装版本: v${LOCAL_VER}${NC}"
+        echo -e "${GREEN}GitHub 最新发布版本: v${LATEST_VER}${NC}"
+        
+        if [ "$LOCAL_VER" = "$LATEST_VER" ]; then
+            echo -e "${PURPLE}➔ 您的 sing-box 核心已经是最新版本，无需更新。${NC}"
+            read -p "是否强制重新安装？(y/n): " REINSTALL
+            if [ "$REINSTALL" != "y" ]; then
+                read -p "操作已取消，按回车键返回..."
+                return
+            fi
+        fi
+    fi
     
     # ⚡ 智能架构自动识别
     ARCH=$(uname -m)
@@ -74,15 +97,7 @@ install_singbox() {
         armv7l)  SINGBOX_ARCH="linux-armv7" ;;
         *)       SINGBOX_ARCH="linux-amd64" ;;
     esac
-    echo -e "${GREEN}检测到当前系统架构为: ${ARCH} -> 匹配包: ${SINGBOX_ARCH}${NC}"
-    
-    # 获取最新稳定版版本号
-    echo -e "${YELLOW}正在检索 GitHub 最新 Release 版本...${NC}"
-    LATEST_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
-    if [ -z "$LATEST_VER" ] || [ "$LATEST_VER" = "null" ]; then
-        LATEST_VER="1.11.2" # 网络极度恶劣情况下的生产保底版本
-    fi
-    
+    echo -e "${GREEN}匹配系统架构: ${ARCH} -> ${SINGBOX_ARCH}${NC}"
     echo -e "${BLUE}目标拉取版本: v${LATEST_VER}${NC}"
     
     # 停止旧服务防止文件占用
@@ -124,7 +139,7 @@ EOF
     systemctl enable sing-box
     systemctl restart sing-box
     
-    echo -e "${GREEN}sing-box 部署完成！当前实际运行状态：$(systemctl is-active sing-box)${NC}"
+    echo -e "${GREEN}sing-box 部署/更新完成！当前实际运行状态：$(systemctl is-active sing-box)${NC}"
     read -p "按回车键返回..."
 }
 
@@ -492,6 +507,81 @@ delete_config() {
     read -p "按回车键返回..."
 }
 
+# 8. 🔥【新增】全场景无缝、纯净卸载环境逻辑
+purge_uninstall() {
+    clear
+    echo -e "${RED}=================================================="
+    echo -e "       ⚠️ 警告：您正在调用深度强制卸载程序 ⚠️"
+    echo -e "=================================================="
+    echo -e " 本操作将破坏性擦除以下资产，绝不残留：${NC}"
+    echo -e " 1. 彻底杀死并解绑 sing-box 核心进程与系统守护服务"
+    echo -e " 2. 彻底抹除核心配置目录及全部节点参数 (/etc/sing-box)"
+    echo -e " 3. 清理 SkyVault Drive 前端伪装网站及页面源码"
+    echo -e " 4. 清理 Nginx 虚拟主机配置并平滑重置服务"
+    echo -e " 5. 吊销并粉碎 acme.sh 签发的本地 SSL 域名证书"
+    echo -e " 6. 抹除本地系统全局的 'sk' 快捷呼出暗号"
+    echo -e "${RED}==================================================${NC}"
+    read -p "确认要将环境卸载得一干二净吗？请输入 (y/n): " PURGE_CONFIRM
+    
+    if [ "$PURGE_CONFIRM" != "y" ]; then
+        echo -e "${GREEN}卸载已取消。环境依然安全。${NC}"
+        read -p "按回车键返回..."
+        return
+    fi
+
+    echo -e "${YELLOW}[*] 正在执行全套清场轰炸...${NC}"
+    source "$ENV_FILE" 2>/dev/null
+
+    # 1. 关停并根除 sing-box 进程服务
+    systemctl stop sing-box &>/dev/null
+    systemctl disable sing-box &>/dev/null
+    rm -f /etc/systemd/system/sing-box.service
+    rm -f /usr/local/bin/sing-box
+    systemctl daemon-reload
+    echo -e "${GREEN}✔ sing-box 核心二进制及服务已注销。${NC}"
+
+    # 2. 粉碎配置路径
+    rm -rf /etc/sing-box
+    echo -e "${GREEN}✔ 节点核心配置文件夹已彻底抹除。${NC}"
+
+    # 3. 根除伪装前端站与恢复 Nginx 纯净状态
+    rm -rf /var/www/skyvault-drive
+    # 清空或重置默认 Nginx 虚拟主机配置文件
+    cat << EOF > /etc/nginx/sites-available/default
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    root /var/www/html;
+    index index.html index.htm;
+    server_name _;
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+    systemctl restart nginx &>/dev/null
+    echo -e "${GREEN}✔ SkyVault Drive 伪装网页与相关 Nginx 规则已净化还原。${NC}"
+
+    # 4. 粉碎域名对应的 SSL 证书
+    if [ -n "$MY_DOMAIN" ] && [ -f "$HOME/.acme.sh/acme.sh" ]; then
+        echo -e "${YELLOW}[*] 正在向证书局解绑并卸载域名证书: $MY_DOMAIN ...${NC}"
+        ~/.acme.sh/acme.sh --remove -d "$MY_DOMAIN" --ecc &>/dev/null
+        rm -rf "$HOME/.acme.sh/${MY_DOMAIN}_ecc"
+        echo -e "${GREEN}✔ 本地本地 SSL 证书链已完全粉碎。${NC}"
+    fi
+
+    # 5. 抹除别名暗号
+    sed -i '/alias sk=/d' ~/.bashrc
+    
+    echo -e "${GREEN}=================================================="
+    echo -e "🎉 卸载完成！所有组件与残留已经清理得干干净净。"
+    echo -e "注：由于别名已被移除，本次退出后 'sk' 命令将不再可用。${NC}"
+    echo -e "${BLUE}==================================================${NC}"
+    
+    # 彻底退出脚本
+    exit 0
+}
+
 # 核心控制台菜单循环
 while true; do
     clear
@@ -499,16 +589,17 @@ while true; do
     echo -e "${BLUE}=================================================="
     echo -e "        SkyVault Drive 核心高级交互式菜单"
     echo -e "=================================================="
-    echo -e " ${GREEN}1)${NC} 安装 / 更新 sing-box 核心环境"
+    echo -e " ${GREEN}1)${NC} 安装 / 更新 sing-box 核心环境 (带版本智能校验)"
     echo -e " ${GREEN}2)${NC} 添加 Shadowsocks 2022 节点 (多加密可选)"
     echo -e " ${GREEN}3)${NC} 部署 / 更新 SkyVault Drive 伪装网站 (全自动SSL)"
     echo -e " ${GREEN}4)${NC} 添加 VLESS-REALITY 节点 (自偷混淆模式)"
     echo -e " ${YELLOW}5) 查看现有节点配置与一键分享链接 (URL)${NC}"
     echo -e " ${BLUE}6) 更改/修改现有节点参数${NC}"
-    echo -e " ${RED}7) 删除指定不需要的代理节点${NC}"
+    echo -e " ${PURPLE}7) 删除指定不需要的代理节点${NC}"
+    echo -e " ${RED}8) 🚨 一键彻底卸载面板与所有相关组件 (清场还原)${NC}"
     echo -e " ${PLAIN}0) 优雅安全退出脚本${NC}"
     echo -e "${BLUE}==================================================${NC}"
-    read -p "请选择操作 [0-7]: " CHOICE
+    read -p "请选择操作 [0-8]: " CHOICE
 
     case $CHOICE in
         1) install_singbox ;;
@@ -518,7 +609,8 @@ while true; do
         5) view_configs ;;
         6) modify_config ;;
         7) delete_config ;;
+        8) purge_uninstall ;;
         0) clear; exit 0 ;;
-        *) echo -e "${RED}输入错误，请输入 0 到 7 的有效命令数字！${NC}" && sleep 1 ;;
+        *) echo -e "${RED}输入错误，请输入 0 到 8 的有效命令数字！${NC}" && sleep 1 ;;
     esac
 done
