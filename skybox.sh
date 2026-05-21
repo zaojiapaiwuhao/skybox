@@ -11,7 +11,7 @@
 # - Nginx 监听 80，用于 acme.sh webroot 续签
 # - Nginx 监听 127.0.0.1:8443 ssl，用于 Reality 自偷
 # - VLESS-REALITY 监听公网 443
-# - 已兼容 sing-box 1.13+，不再使用 legacy inbound fields
+# - 兼容 sing-box 1.13+，不再使用 legacy inbound fields
 # ==========================================================
 
 RED='\033[0;31m'
@@ -100,6 +100,14 @@ valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
+valid_uuid_format() {
+    [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+valid_hex_string() {
+    [[ "$1" =~ ^[0-9a-fA-F]+$ ]]
+}
+
 ensure_json() {
     if [ ! -s "$CONFIG_FILE" ]; then
         cat > "$CONFIG_FILE" <<EOF
@@ -168,6 +176,21 @@ check_singbox_config() {
     if [ $? -ne 0 ]; then
         echo -e "${RED}sing-box 配置检查失败：${NC}"
         cat /tmp/singbox_check.log
+        return 1
+    fi
+
+    return 0
+}
+
+restart_singbox_checked() {
+    if ! check_singbox_config; then
+        return 1
+    fi
+
+    systemctl restart sing-box
+
+    if ! systemctl is-active sing-box >/dev/null 2>&1; then
+        echo -e "${RED}sing-box 启动失败，请查看日志：journalctl -u sing-box -e${NC}"
         return 1
     fi
 
@@ -586,15 +609,14 @@ add_ss2022() {
         "password": $password
       }]' "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
 
-    if ! check_singbox_config; then
+    if ! restart_singbox_checked; then
         echo -e "${RED}新配置无效，正在回滚。${NC}"
         BAK=$(latest_backup_file)
         [ -n "$BAK" ] && cp "$BAK" "$CONFIG_FILE"
+        systemctl restart sing-box >/dev/null 2>&1
         pause
         return
     fi
-
-    systemctl restart sing-box
 
     LOCAL_IP=$(get_public_ip)
     BASE64_CREDS=$(echo -n "${METHOD}:${PASSWORD}" | base64 | tr -d '\n' | tr -d '=')
@@ -959,20 +981,13 @@ add_vless_reality() {
     echo "${SAFE_TAG}_PUBLIC_KEY=\"$PUBLIC_KEY\"" >> "$ENV_FILE"
     echo "${SAFE_TAG}_SHORT_ID=\"$SHORT_ID\"" >> "$ENV_FILE"
 
-    if ! check_singbox_config; then
+    if ! restart_singbox_checked; then
         echo -e "${RED}新配置无效，正在回滚。${NC}"
         BAK=$(latest_backup_file)
         [ -n "$BAK" ] && cp "$BAK" "$CONFIG_FILE"
         sed -i "/^${SAFE_TAG}_PUBLIC_KEY=/d" "$ENV_FILE"
         sed -i "/^${SAFE_TAG}_SHORT_ID=/d" "$ENV_FILE"
-        pause
-        return
-    fi
-
-    systemctl restart sing-box
-
-    if ! systemctl is-active sing-box >/dev/null 2>&1; then
-        echo -e "${RED}sing-box 启动失败，请查看日志：journalctl -u sing-box -e${NC}"
+        systemctl restart sing-box >/dev/null 2>&1
         pause
         return
     fi
@@ -1076,10 +1091,11 @@ modify_config() {
     for ((i=0; i<LENGTH; i++)); do
         TAG=$(jq -r ".inbounds[$i].tag" "$CONFIG_FILE")
         TYPE=$(jq -r ".inbounds[$i].type" "$CONFIG_FILE")
-        echo "$i) $TAG ($TYPE)"
+        PORT=$(jq -r ".inbounds[$i].listen_port" "$CONFIG_FILE")
+        echo "$i) $TAG ($TYPE / 端口: $PORT)"
     done
 
-    read -p "请选择索引: " INDEX
+    read -p "请选择要修改的节点索引: " INDEX
     if ! [[ "$INDEX" =~ ^[0-9]+$ ]] || [ "$INDEX" -ge "$LENGTH" ]; then
         echo -e "${RED}无效索引。${NC}"
         pause
@@ -1087,62 +1103,372 @@ modify_config() {
     fi
 
     TYPE=$(jq -r ".inbounds[$INDEX].type" "$CONFIG_FILE")
+    OLD_TAG=$(jq -r ".inbounds[$INDEX].tag" "$CONFIG_FILE")
+    ENV_BAK=$(mktemp)
+    cp "$ENV_FILE" "$ENV_BAK" 2>/dev/null
 
     backup_config
 
     if [ "$TYPE" = "shadowsocks" ]; then
-        read -p "新端口，回车不改: " NEW_PORT
+        while true; do
+            CURRENT_TAG=$(jq -r ".inbounds[$INDEX].tag" "$CONFIG_FILE")
 
-        if [ -n "$NEW_PORT" ]; then
-            if ! valid_port "$NEW_PORT"; then
-                echo -e "${RED}端口无效。${NC}"
-                pause
-                return
-            fi
+            clear
+            echo -e "${BLUE}正在修改 Shadowsocks 2022 节点：$CURRENT_TAG${NC}"
+            echo "1) 修改节点标签"
+            echo "2) 修改端口"
+            echo "3) 修改密码"
+            echo "4) 修改加密方式"
+            echo "5) 查看当前配置"
+            echo "0) 保存并返回"
+            echo
+            read -p "请选择操作 [0-5]: " SS_CHOICE
 
-            if jq -e --argjson port "$NEW_PORT" --argjson idx "$INDEX" '.inbounds | to_entries[] | select(.key != $idx and .value.listen_port == $port)' "$CONFIG_FILE" >/dev/null 2>&1; then
-                echo -e "${RED}端口已被其他节点占用。${NC}"
-                pause
-                return
-            fi
+            case "$SS_CHOICE" in
+                1)
+                    read -p "请输入新的节点标签: " NEW_TAG
+                    if [ -z "$NEW_TAG" ]; then
+                        echo -e "${RED}标签不能为空。${NC}"
+                        pause
+                        continue
+                    fi
 
-            TMP=$(mktemp)
-            jq --argjson port "$NEW_PORT" ".inbounds[$INDEX].listen_port = \$port" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
-        fi
+                    if jq -e --arg tag "$NEW_TAG" --arg old "$CURRENT_TAG" '.inbounds[]? | select(.tag == $tag and .tag != $old)' "$CONFIG_FILE" >/dev/null; then
+                        echo -e "${RED}该标签已存在。${NC}"
+                        pause
+                        continue
+                    fi
 
-        read -p "是否重置密码？(y/n): " RESET_PASS
-        if [ "$RESET_PASS" = "y" ]; then
-            METHOD=$(jq -r ".inbounds[$INDEX].method" "$CONFIG_FILE")
-            if [ "$METHOD" = "2022-blake3-aes-128-gcm" ]; then
-                NEW_PASS=$(sing-box generate rand --base64 16 2>/dev/null || openssl rand -base64 16)
-            else
-                NEW_PASS=$(sing-box generate rand --base64 32 2>/dev/null || openssl rand -base64 32)
-            fi
+                    TMP=$(mktemp)
+                    jq --arg tag "$NEW_TAG" ".inbounds[$INDEX].tag = \$tag" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
 
-            TMP=$(mktemp)
-            jq --arg pass "$NEW_PASS" ".inbounds[$INDEX].password = \$pass" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
-        fi
+                    echo -e "${GREEN}标签已修改。${NC}"
+                    pause
+                    ;;
+
+                2)
+                    read -p "请输入新端口: " NEW_PORT
+                    if ! valid_port "$NEW_PORT"; then
+                        echo -e "${RED}端口无效。${NC}"
+                        pause
+                        continue
+                    fi
+
+                    if jq -e --argjson port "$NEW_PORT" --argjson idx "$INDEX" '.inbounds | to_entries[] | select(.key != $idx and .value.listen_port == $port)' "$CONFIG_FILE" >/dev/null 2>&1; then
+                        echo -e "${RED}端口已被其他节点占用。${NC}"
+                        pause
+                        continue
+                    fi
+
+                    TMP=$(mktemp)
+                    jq --argjson port "$NEW_PORT" ".inbounds[$INDEX].listen_port = \$port" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
+
+                    echo -e "${GREEN}端口已修改。${NC}"
+                    pause
+                    ;;
+
+                3)
+                    echo "请选择密码修改方式："
+                    echo "1) 随机生成安全密码"
+                    echo "2) 自定义输入密码"
+                    read -p "请选择 [1-2]: " PASS_CHOICE
+
+                    if [ "$PASS_CHOICE" = "1" ]; then
+                        METHOD=$(jq -r ".inbounds[$INDEX].method" "$CONFIG_FILE")
+                        if [ "$METHOD" = "2022-blake3-aes-128-gcm" ]; then
+                            NEW_PASS=$(sing-box generate rand --base64 16 2>/dev/null || openssl rand -base64 16)
+                        else
+                            NEW_PASS=$(sing-box generate rand --base64 32 2>/dev/null || openssl rand -base64 32)
+                        fi
+                    elif [ "$PASS_CHOICE" = "2" ]; then
+                        read -p "请输入自定义密码: " NEW_PASS
+                        if [ -z "$NEW_PASS" ]; then
+                            echo -e "${RED}密码不能为空。${NC}"
+                            pause
+                            continue
+                        fi
+                    else
+                        echo -e "${RED}无效选择。${NC}"
+                        pause
+                        continue
+                    fi
+
+                    TMP=$(mktemp)
+                    jq --arg pass "$NEW_PASS" ".inbounds[$INDEX].password = \$pass" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
+
+                    echo -e "${GREEN}密码已修改。${NC}"
+                    echo -e "${YELLOW}新密码：$NEW_PASS${NC}"
+                    pause
+                    ;;
+
+                4)
+                    echo "请选择新的加密方式："
+                    echo "1) 2022-blake3-aes-128-gcm"
+                    echo "2) 2022-blake3-aes-256-gcm"
+                    echo "3) 2022-blake3-chacha20-poly1305"
+                    read -p "请选择 [1-3]: " METHOD_CHOICE
+
+                    case "$METHOD_CHOICE" in
+                        1) NEW_METHOD="2022-blake3-aes-128-gcm" ;;
+                        2) NEW_METHOD="2022-blake3-aes-256-gcm" ;;
+                        3) NEW_METHOD="2022-blake3-chacha20-poly1305" ;;
+                        *)
+                            echo -e "${RED}无效选择。${NC}"
+                            pause
+                            continue
+                            ;;
+                    esac
+
+                    echo -e "${YELLOW}注意：修改加密方式后，建议同时重置密码，以保证密钥长度匹配。${NC}"
+                    read -p "是否自动生成匹配长度的新密码？(y/n): " RESET_MATCH_PASS
+
+                    if [ "$RESET_MATCH_PASS" = "y" ]; then
+                        if [ "$NEW_METHOD" = "2022-blake3-aes-128-gcm" ]; then
+                            NEW_PASS=$(sing-box generate rand --base64 16 2>/dev/null || openssl rand -base64 16)
+                        else
+                            NEW_PASS=$(sing-box generate rand --base64 32 2>/dev/null || openssl rand -base64 32)
+                        fi
+
+                        TMP=$(mktemp)
+                        jq --arg method "$NEW_METHOD" --arg pass "$NEW_PASS" \
+                            ".inbounds[$INDEX].method = \$method | .inbounds[$INDEX].password = \$pass" \
+                            "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
+
+                        echo -e "${GREEN}加密方式与密码已修改。${NC}"
+                        echo -e "${YELLOW}新密码：$NEW_PASS${NC}"
+                    else
+                        TMP=$(mktemp)
+                        jq --arg method "$NEW_METHOD" ".inbounds[$INDEX].method = \$method" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
+
+                        echo -e "${GREEN}加密方式已修改。${NC}"
+                    fi
+
+                    pause
+                    ;;
+
+                5)
+                    clear
+                    echo -e "${BLUE}当前 Shadowsocks 节点配置：${NC}"
+                    jq ".inbounds[$INDEX]" "$CONFIG_FILE"
+                    pause
+                    ;;
+
+                0)
+                    break
+                    ;;
+
+                *)
+                    echo -e "${RED}输入错误。${NC}"
+                    sleep 1
+                    ;;
+            esac
+        done
 
     elif [ "$TYPE" = "vless" ]; then
-        read -p "是否重置 UUID？(y/n): " RESET_UUID
-        if [ "$RESET_UUID" = "y" ]; then
-            NEW_UUID=$(sing-box generate uuid)
-            TMP=$(mktemp)
-            jq --arg uuid "$NEW_UUID" ".inbounds[$INDEX].users[0].uuid = \$uuid" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
-        fi
-    fi
+        while true; do
+            clear
+            CURRENT_TAG=$(jq -r ".inbounds[$INDEX].tag" "$CONFIG_FILE")
+            CURRENT_SAFE_TAG=$(safe_var_name "$CURRENT_TAG")
 
-    if ! check_singbox_config; then
-        echo -e "${RED}修改后配置无效，正在回滚。${NC}"
-        BAK=$(latest_backup_file)
-        [ -n "$BAK" ] && cp "$BAK" "$CONFIG_FILE"
+            echo -e "${BLUE}正在修改 VLESS-REALITY 节点：$CURRENT_TAG${NC}"
+            echo "1) 修改节点标签"
+            echo "2) 修改 UUID"
+            echo "3) 修改 Short ID"
+            echo "4) 重新生成 Reality 密钥对"
+            echo "5) 查看当前配置"
+            echo "0) 保存并返回"
+            echo
+            read -p "请选择操作 [0-5]: " VL_CHOICE
+
+            case "$VL_CHOICE" in
+                1)
+                    read -p "请输入新的节点标签: " NEW_TAG
+                    if [ -z "$NEW_TAG" ]; then
+                        echo -e "${RED}标签不能为空。${NC}"
+                        pause
+                        continue
+                    fi
+
+                    if jq -e --arg tag "$NEW_TAG" --arg old "$CURRENT_TAG" '.inbounds[]? | select(.tag == $tag and .tag != $old)' "$CONFIG_FILE" >/dev/null; then
+                        echo -e "${RED}该标签已存在。${NC}"
+                        pause
+                        continue
+                    fi
+
+                    NEW_SAFE_TAG=$(safe_var_name "$NEW_TAG")
+
+                    eval OLD_PUB="\$${CURRENT_SAFE_TAG}_PUBLIC_KEY"
+                    eval OLD_SID="\$${CURRENT_SAFE_TAG}_SHORT_ID"
+
+                    TMP=$(mktemp)
+                    jq --arg tag "$NEW_TAG" ".inbounds[$INDEX].tag = \$tag" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
+
+                    sed -i "/^${CURRENT_SAFE_TAG}_PUBLIC_KEY=/d" "$ENV_FILE"
+                    sed -i "/^${CURRENT_SAFE_TAG}_SHORT_ID=/d" "$ENV_FILE"
+
+                    [ -n "$OLD_PUB" ] && echo "${NEW_SAFE_TAG}_PUBLIC_KEY=\"$OLD_PUB\"" >> "$ENV_FILE"
+                    [ -n "$OLD_SID" ] && echo "${NEW_SAFE_TAG}_SHORT_ID=\"$OLD_SID\"" >> "$ENV_FILE"
+
+                    echo -e "${GREEN}标签已修改，并同步环境变量。${NC}"
+                    pause
+                    ;;
+
+                2)
+                    echo "请选择 UUID 修改方式："
+                    echo "1) 随机生成 UUID"
+                    echo "2) 自定义输入 UUID"
+                    read -p "请选择 [1-2]: " UUID_CHOICE
+
+                    if [ "$UUID_CHOICE" = "1" ]; then
+                        NEW_UUID=$(sing-box generate uuid)
+                    elif [ "$UUID_CHOICE" = "2" ]; then
+                        read -p "请输入自定义 UUID: " NEW_UUID
+                        if [ -z "$NEW_UUID" ]; then
+                            echo -e "${RED}UUID 不能为空。${NC}"
+                            pause
+                            continue
+                        fi
+
+                        if ! valid_uuid_format "$NEW_UUID"; then
+                            echo -e "${RED}UUID 格式不正确。${NC}"
+                            pause
+                            continue
+                        fi
+                    else
+                        echo -e "${RED}无效选择。${NC}"
+                        pause
+                        continue
+                    fi
+
+                    TMP=$(mktemp)
+                    jq --arg uuid "$NEW_UUID" ".inbounds[$INDEX].users[0].uuid = \$uuid" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
+
+                    echo -e "${GREEN}UUID 已修改。${NC}"
+                    echo -e "${YELLOW}新 UUID：$NEW_UUID${NC}"
+                    pause
+                    ;;
+
+                3)
+                    echo "请选择 Short ID 修改方式："
+                    echo "1) 随机生成 Short ID"
+                    echo "2) 自定义输入 Short ID"
+                    read -p "请选择 [1-2]: " SID_CHOICE
+
+                    if [ "$SID_CHOICE" = "1" ]; then
+                        NEW_SID=$(openssl rand -hex 8)
+                    elif [ "$SID_CHOICE" = "2" ]; then
+                        read -p "请输入自定义 Short ID，建议 hex，长度 2-16 字节: " NEW_SID
+                        if [ -z "$NEW_SID" ]; then
+                            echo -e "${RED}Short ID 不能为空。${NC}"
+                            pause
+                            continue
+                        fi
+
+                        if ! valid_hex_string "$NEW_SID"; then
+                            echo -e "${RED}Short ID 必须是十六进制字符串。${NC}"
+                            pause
+                            continue
+                        fi
+
+                        SID_LEN=${#NEW_SID}
+                        if [ "$SID_LEN" -lt 2 ] || [ "$SID_LEN" -gt 32 ]; then
+                            echo -e "${RED}Short ID 长度建议为 2-32 个 hex 字符。${NC}"
+                            pause
+                            continue
+                        fi
+                    else
+                        echo -e "${RED}无效选择。${NC}"
+                        pause
+                        continue
+                    fi
+
+                    TMP=$(mktemp)
+                    jq --arg sid "$NEW_SID" ".inbounds[$INDEX].tls.reality.short_id = [\$sid]" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
+
+                    sed -i "/^${CURRENT_SAFE_TAG}_SHORT_ID=/d" "$ENV_FILE"
+                    echo "${CURRENT_SAFE_TAG}_SHORT_ID=\"$NEW_SID\"" >> "$ENV_FILE"
+
+                    echo -e "${GREEN}Short ID 已修改。${NC}"
+                    echo -e "${YELLOW}新 Short ID：$NEW_SID${NC}"
+                    pause
+                    ;;
+
+                4)
+                    read -p "确认重新生成 Reality 密钥对？客户端 PublicKey 会变化。(y/n): " CONFIRM_KEY
+                    [ "$CONFIRM_KEY" != "y" ] && continue
+
+                    KEYPAIR=$(sing-box generate reality-keypair)
+                    NEW_PRIVATE_KEY=$(echo "$KEYPAIR" | grep -i "PrivateKey" | awk '{print $2}')
+                    NEW_PUBLIC_KEY=$(echo "$KEYPAIR" | grep -i "PublicKey" | awk '{print $2}')
+
+                    if [ -z "$NEW_PRIVATE_KEY" ] || [ -z "$NEW_PUBLIC_KEY" ]; then
+                        echo -e "${RED}Reality 密钥生成失败。${NC}"
+                        pause
+                        continue
+                    fi
+
+                    TMP=$(mktemp)
+                    jq --arg private_key "$NEW_PRIVATE_KEY" ".inbounds[$INDEX].tls.reality.private_key = \$private_key" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
+
+                    sed -i "/^${CURRENT_SAFE_TAG}_PUBLIC_KEY=/d" "$ENV_FILE"
+                    echo "${CURRENT_SAFE_TAG}_PUBLIC_KEY=\"$NEW_PUBLIC_KEY\"" >> "$ENV_FILE"
+
+                    echo -e "${GREEN}Reality 密钥对已重新生成。${NC}"
+                    echo -e "${YELLOW}新 PublicKey：$NEW_PUBLIC_KEY${NC}"
+                    pause
+                    ;;
+
+                5)
+                    clear
+                    echo -e "${BLUE}当前 VLESS-REALITY 节点配置：${NC}"
+                    jq ".inbounds[$INDEX]" "$CONFIG_FILE"
+
+                    eval PUB_KEY="\$${CURRENT_SAFE_TAG}_PUBLIC_KEY"
+                    eval SID="\$${CURRENT_SAFE_TAG}_SHORT_ID"
+
+                    echo
+                    echo -e "${YELLOW}环境文件记录：${NC}"
+                    echo "PublicKey: ${PUB_KEY:-未找到}"
+                    echo "ShortID: ${SID:-未找到}"
+                    pause
+                    ;;
+
+                0)
+                    break
+                    ;;
+
+                *)
+                    echo -e "${RED}输入错误。${NC}"
+                    sleep 1
+                    ;;
+            esac
+        done
+    else
+        echo -e "${RED}暂不支持修改该类型节点：$TYPE${NC}"
         pause
         return
     fi
 
-    systemctl restart sing-box
-    echo -e "${GREEN}修改已生效。${NC}"
+    cleanup_legacy_inbound_fields
 
+    if ! restart_singbox_checked; then
+        echo -e "${RED}修改后配置无效，正在回滚。${NC}"
+        BAK=$(latest_backup_file)
+        [ -n "$BAK" ] && cp "$BAK" "$CONFIG_FILE"
+
+        if [ -f "$ENV_BAK" ]; then
+            cp "$ENV_BAK" "$ENV_FILE"
+        fi
+
+        systemctl restart sing-box >/dev/null 2>&1
+        rm -f "$ENV_BAK"
+        pause
+        return
+    fi
+
+    rm -f "$ENV_BAK"
+
+    echo -e "${GREEN}节点修改已保存，sing-box 已重启生效。${NC}"
     pause
 }
 
@@ -1180,6 +1506,8 @@ delete_config() {
     [ "$CONFIRM" != "y" ] && return
 
     backup_config
+    ENV_BAK=$(mktemp)
+    cp "$ENV_FILE" "$ENV_BAK" 2>/dev/null
 
     TMP=$(mktemp)
     jq --arg tag "$TARGET_TAG" 'del(.inbounds[] | select(.tag == $tag))' "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
@@ -1187,17 +1515,20 @@ delete_config() {
     sed -i "/^${SAFE_TAG}_PUBLIC_KEY=/d" "$ENV_FILE"
     sed -i "/^${SAFE_TAG}_SHORT_ID=/d" "$ENV_FILE"
 
-    if ! check_singbox_config; then
+    if ! restart_singbox_checked; then
         echo -e "${RED}删除后配置异常，正在回滚。${NC}"
         BAK=$(latest_backup_file)
         [ -n "$BAK" ] && cp "$BAK" "$CONFIG_FILE"
+        [ -f "$ENV_BAK" ] && cp "$ENV_BAK" "$ENV_FILE"
+        systemctl restart sing-box >/dev/null 2>&1
+        rm -f "$ENV_BAK"
         pause
         return
     fi
 
-    systemctl restart sing-box
-    echo -e "${GREEN}节点已删除。${NC}"
+    rm -f "$ENV_BAK"
 
+    echo -e "${GREEN}节点已删除。${NC}"
     pause
 }
 
