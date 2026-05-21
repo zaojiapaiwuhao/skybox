@@ -1,16 +1,12 @@
 #!/bin/bash
 
 # ==========================================================
-# SkyVault Drive + sing-box 管理脚本
-# 功能：
-# 1. 安装/更新 sing-box
-# 2. 添加 Shadowsocks 2022
-# 3. 部署伪装网站 + Webroot 自动证书
-# 4. 添加 VLESS-REALITY 自偷自己伪装站
-# 5. 查看节点和分享链接
-# 6. 修改节点
-# 7. 删除节点
-# 8. 卸载
+# SkyVault Drive + sing-box 高级交互式管理脚本
+# 架构：
+# - sing-box 从 GitHub Release 拉取安装
+# - Nginx 仅监听 80 和 127.0.0.1:8443
+# - VLESS-REALITY 监听公网 443
+# - Reality handshake 转发到 127.0.0.1:8443，自偷自己的伪装网站
 # ==========================================================
 
 RED='\033[0;31m'
@@ -23,21 +19,22 @@ NC='\033[0m'
 CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="/etc/sing-box/config.json"
 ENV_FILE="/etc/sing-box/script_env.sh"
+
 WEB_ROOT="/var/www/skyvault-drive"
 NGINX_SITE="/etc/nginx/sites-available/skyvault"
 NGINX_LINK="/etc/nginx/sites-enabled/skyvault"
 
-# --------------------------
+# ==========================================================
 # root 检查
-# --------------------------
+# ==========================================================
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}错误：请以 root 用户运行此脚本！${NC}"
     exit 1
 fi
 
-# --------------------------
+# ==========================================================
 # 通用函数
-# --------------------------
+# ==========================================================
 pause() {
     read -p "按回车键返回..."
 }
@@ -48,6 +45,26 @@ safe_var_name() {
 
 get_public_ip() {
     curl -fsS4 https://api.ipify.org 2>/dev/null || curl -fsS4 https://icanhazip.com 2>/dev/null
+}
+
+# 更稳的 IPv4 DNS 查询函数：dig -> getent -> nslookup
+resolve_domain_ipv4() {
+    local domain="$1"
+    local result=""
+
+    if command -v dig >/dev/null 2>&1; then
+        result=$(dig +short A "$domain" 2>/dev/null | grep -E '^[0-9.]+$' | sort -u)
+    fi
+
+    if [ -z "$result" ] && command -v getent >/dev/null 2>&1; then
+        result=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u)
+    fi
+
+    if [ -z "$result" ] && command -v nslookup >/dev/null 2>&1; then
+        result=$(nslookup "$domain" 2>/dev/null | awk '/^Address: / {print $2}' | grep -E '^[0-9.]+$' | sort -u)
+    fi
+
+    echo "$result"
 }
 
 urlencode() {
@@ -69,6 +86,7 @@ urlencode() {
         esac
         encoded+="$o"
     done
+
     echo "$encoded"
 }
 
@@ -93,7 +111,36 @@ ensure_json() {
   ]
 }
 EOF
+        return
     fi
+
+    if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${RED}检测到 config.json 不是有效 JSON，已备份并重建基础配置。${NC}"
+        cp "$CONFIG_FILE" "${CONFIG_FILE}.invalid.$(date +%s)"
+        cat > "$CONFIG_FILE" <<EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+    fi
+}
+
+backup_config() {
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%s)"
+}
+
+latest_backup_file() {
+    ls -t "${CONFIG_FILE}".bak.* 2>/dev/null | head -n 1
 }
 
 check_singbox_config() {
@@ -108,16 +155,13 @@ check_singbox_config() {
         cat /tmp/singbox_check.log
         return 1
     fi
+
     return 0
 }
 
-backup_config() {
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%s)"
-}
-
-# --------------------------
+# ==========================================================
 # 初始化环境
-# --------------------------
+# ==========================================================
 init_env() {
     mkdir -p "$CONFIG_DIR"
     [ ! -f "$ENV_FILE" ] && touch "$ENV_FILE"
@@ -127,19 +171,41 @@ init_env() {
     source "$ENV_FILE" 2>/dev/null
 
     local need_install=0
-    for cmd in jq curl wget openssl socat nginx dig fuser cron; do
+
+    for cmd in jq curl wget openssl socat nginx fuser; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             need_install=1
         fi
     done
 
+    # dig 不存在时尝试安装，但 DNS 检测仍然有 getent/nslookup 备用方案
+    if ! command -v dig >/dev/null 2>&1; then
+        need_install=1
+    fi
+
     if [ "$need_install" -eq 1 ]; then
         echo -e "${YELLOW}正在安装基础依赖：jq curl wget openssl socat nginx dnsutils cron psmisc...${NC}"
-        apt-get update -y
-        apt-get install -y jq curl wget openssl socat nginx unzip cron psmisc dnsutils ca-certificates
+
+        if ! apt-get update -y; then
+            echo -e "${RED}apt update 失败。${NC}"
+            echo -e "${YELLOW}请检查 /etc/apt/sources.list 和 /etc/apt/sources.list.d/ 下是否有损坏的软件源。${NC}"
+            return 1
+        fi
+
+        apt-get install -y jq curl wget openssl socat nginx unzip cron psmisc ca-certificates dnsutils
+
+        # 某些系统 dnsutils 包未提供 dig 时，再尝试 bind9-dnsutils
+        if ! command -v dig >/dev/null 2>&1; then
+            apt-get install -y bind9-dnsutils
+        fi
+    fi
+
+    if ! command -v dig >/dev/null 2>&1; then
+        echo -e "${YELLOW}提示：dig 仍不可用，DNS 检测将使用 getent/nslookup 备用方式。${NC}"
     fi
 
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+
     systemctl enable nginx >/dev/null 2>&1
 
     ensure_json
@@ -148,6 +214,8 @@ init_env() {
         ln -sf "$(realpath "$0")" /usr/local/bin/sk 2>/dev/null
         chmod +x /usr/local/bin/sk 2>/dev/null
     fi
+
+    return 0
 }
 
 # ==========================================================
@@ -155,18 +223,18 @@ init_env() {
 # ==========================================================
 install_singbox() {
     clear
-    echo -e "${BLUE}[1] 安装 / 更新 sing-box 核心${NC}"
+    echo -e "${BLUE}[1] 安装 / 更新 sing-box 核心环境${NC}"
 
     if ! command -v jq >/dev/null 2>&1; then
         apt-get update -y
         apt-get install -y jq curl wget tar
     fi
 
-    echo -e "${YELLOW}正在获取 GitHub 最新版本...${NC}"
+    echo -e "${YELLOW}正在获取 GitHub 最新 Release 版本...${NC}"
     LATEST_VER=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r .tag_name | sed 's/^v//')
 
     if [ -z "$LATEST_VER" ] || [ "$LATEST_VER" = "null" ]; then
-        echo -e "${RED}获取最新版本失败。请检查网络或 GitHub 访问。${NC}"
+        echo -e "${RED}获取最新版本失败，请检查服务器是否能访问 GitHub。${NC}"
         pause
         return
     fi
@@ -197,7 +265,7 @@ install_singbox() {
 
     DOWNLOAD_URL="https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-${SINGBOX_ARCH}.tar.gz"
 
-    echo -e "${YELLOW}下载：$DOWNLOAD_URL${NC}"
+    echo -e "${YELLOW}下载地址：$DOWNLOAD_URL${NC}"
     if ! wget -O sing-box.tar.gz "$DOWNLOAD_URL"; then
         echo -e "${RED}下载失败。${NC}"
         rm -rf "$TMP_DIR"
@@ -252,7 +320,7 @@ EOF
 
     if check_singbox_config; then
         systemctl restart sing-box
-        echo -e "${GREEN}sing-box 安装/更新完成，状态：$(systemctl is-active sing-box)${NC}"
+        echo -e "${GREEN}sing-box 安装 / 更新完成。当前状态：$(systemctl is-active sing-box)${NC}"
     else
         echo -e "${RED}配置检查失败，未启动 sing-box。${NC}"
     fi
@@ -261,7 +329,7 @@ EOF
 }
 
 # ==========================================================
-# 2. 添加 Shadowsocks 2022
+# 2. 添加 Shadowsocks 2022 节点
 # ==========================================================
 add_ss2022() {
     clear
@@ -277,7 +345,7 @@ add_ss2022() {
     [ -z "$TAG" ] && TAG="SS_2022_$(openssl rand -hex 3)"
 
     if jq -e --arg tag "$TAG" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null; then
-        echo -e "${RED}标签已存在。${NC}"
+        echo -e "${RED}标签已存在，请换一个。${NC}"
         pause
         return
     fi
@@ -337,7 +405,8 @@ add_ss2022() {
 
     if ! check_singbox_config; then
         echo -e "${RED}新配置无效，正在回滚。${NC}"
-        cp "$(ls -t ${CONFIG_FILE}.bak.* | head -n1)" "$CONFIG_FILE"
+        BAK=$(latest_backup_file)
+        [ -n "$BAK" ] && cp "$BAK" "$CONFIG_FILE"
         pause
         return
     fi
@@ -356,11 +425,12 @@ add_ss2022() {
     echo "密钥：$PASSWORD"
     echo -e "${YELLOW}分享链接：${NC}"
     echo "$SHARE_LINK"
+
     pause
 }
 
 # ==========================================================
-# 3. 部署 / 更新 SkyVault Drive 伪装网站
+# 3. 部署 / 更新 SkyVault Drive 伪装网站 + SSL
 # ==========================================================
 deploy_website() {
     clear
@@ -374,16 +444,29 @@ deploy_website() {
     fi
 
     LOCAL_IP=$(get_public_ip)
-    DOMAIN_IPS=$(dig +short A "$DOMAIN" | grep -E '^[0-9.]+$')
+    DOMAIN_IPS=$(resolve_domain_ipv4 "$DOMAIN")
 
-    echo -e "${YELLOW}本机 IPv4：$LOCAL_IP${NC}"
+    echo -e "${YELLOW}本机 IPv4：${LOCAL_IP:-获取失败}${NC}"
     echo -e "${YELLOW}域名 A 记录：${DOMAIN_IPS:-未查询到}${NC}"
 
-    if ! echo "$DOMAIN_IPS" | grep -qx "$LOCAL_IP"; then
+    if [ -z "$LOCAL_IP" ]; then
+        echo -e "${RED}无法获取本机公网 IPv4，请检查服务器网络。${NC}"
+        pause
+        return
+    fi
+
+    if [ -z "$DOMAIN_IPS" ]; then
+        echo -e "${RED}未能查询到域名 A 记录。${NC}"
+        echo -e "${YELLOW}这可能是 VPS 本机 DNS 查询异常，不一定代表 DNS 面板没有记录。${NC}"
+        read -p "是否继续尝试申请证书？(y/n): " FORCE
+        [ "$FORCE" != "y" ] && return
+    elif ! echo "$DOMAIN_IPS" | grep -qx "$LOCAL_IP"; then
         echo -e "${RED}警告：域名 A 记录未解析到本机 IPv4。${NC}"
-        echo -e "${YELLOW}如果你用了 Cloudflare，请确保该域名为 DNS only / 灰云。${NC}"
+        echo -e "${YELLOW}如果使用 Cloudflare，请确保该记录为 DNS only / 灰云。${NC}"
         read -p "是否继续？(y/n): " FORCE
         [ "$FORCE" != "y" ] && return
+    else
+        echo -e "${GREEN}域名解析校验通过：$DOMAIN -> $LOCAL_IP${NC}"
     fi
 
     sed -i '/^MY_DOMAIN=/d' "$ENV_FILE"
@@ -412,6 +495,7 @@ deploy_website() {
         }
         .card {
             width: 420px;
+            max-width: calc(100vw - 40px);
             padding: 36px;
             border-radius: 24px;
             background: rgba(15, 23, 42, .86);
@@ -430,8 +514,14 @@ deploy_website() {
             justify-content: center;
             font-size: 34px;
         }
-        h1 { margin: 0; font-size: 28px; }
-        p { color: #94a3b8; line-height: 1.7; }
+        h1 {
+            margin: 0;
+            font-size: 28px;
+        }
+        p {
+            color: #94a3b8;
+            line-height: 1.7;
+        }
         input {
             width: 100%;
             box-sizing: border-box;
@@ -476,7 +566,7 @@ deploy_website() {
 </html>
 EOF
 
-    # 先写 HTTP 配置，用于 webroot 申请和续签证书
+    # 先写 HTTP 配置，用于 webroot 签发和后续续签
     cat > "$NGINX_SITE" <<EOF
 server {
     listen 80;
@@ -517,7 +607,7 @@ EOF
     "$HOME/.acme.sh/acme.sh" --issue -d "$DOMAIN" -w "$WEB_ROOT" --keylength ec-256
 
     if [ ! -f "$HOME/.acme.sh/${DOMAIN}_ecc/fullchain.cer" ]; then
-        echo -e "${RED}证书签发失败。请检查：DNS、80端口、防火墙、域名是否灰云直连。${NC}"
+        echo -e "${RED}证书签发失败。请检查 DNS、80 端口、防火墙、Cloudflare 是否灰云。${NC}"
         pause
         return
     fi
@@ -529,7 +619,9 @@ EOF
         --fullchain-file "/etc/nginx/ssl/$DOMAIN/fullchain.cer" \
         --reloadcmd "systemctl reload nginx"
 
-    # 最终配置：80 用于续签，127.0.0.1:8443 给 Reality 自偷
+    # 最终配置：
+    # 80：用于 acme.sh 后续 webroot 续签
+    # 127.0.0.1:8443：用于 Reality 自偷 handshake
     cat > "$NGINX_SITE" <<EOF
 server {
     listen 80;
@@ -572,8 +664,10 @@ EOF
 
     systemctl restart nginx
 
-    echo -e "${GREEN}SkyVault Drive 伪装站部署完成。${NC}"
-    echo -e "${YELLOW}说明：Nginx 的 HTTPS 只监听 127.0.0.1:8443。公网 443 将由 sing-box Reality 接管。${NC}"
+    echo -e "${GREEN}SkyVault Drive 伪装网站部署完成。${NC}"
+    echo -e "${YELLOW}说明：Nginx HTTPS 只监听 127.0.0.1:8443。公网 443 将由 sing-box Reality 接管。${NC}"
+    echo -e "${YELLOW}完成第 4 步后，Reality 探测流量会看到这个伪装网站。${NC}"
+
     pause
 }
 
@@ -679,7 +773,8 @@ add_vless_reality() {
 
     if ! check_singbox_config; then
         echo -e "${RED}新配置无效，正在回滚。${NC}"
-        cp "$(ls -t ${CONFIG_FILE}.bak.* | head -n1)" "$CONFIG_FILE"
+        BAK=$(latest_backup_file)
+        [ -n "$BAK" ] && cp "$BAK" "$CONFIG_FILE"
         sed -i "/^${SAFE_TAG}_PUBLIC_KEY=/d" "$ENV_FILE"
         sed -i "/^${SAFE_TAG}_SHORT_ID=/d" "$ENV_FILE"
         pause
@@ -706,6 +801,7 @@ add_vless_reality() {
     echo "ShortID：$SHORT_ID"
     echo -e "${YELLOW}分享链接：${NC}"
     echo "$SHARE_LINK"
+
     pause
 }
 
@@ -763,6 +859,8 @@ view_configs() {
                 echo "端口：443"
                 echo "UUID：$UUID"
                 echo "SNI：$DOMAIN"
+                echo "PublicKey：$PUB_KEY"
+                echo "ShortID：$SID"
                 echo -e "${YELLOW}链接：$LINK${NC}"
             fi
         fi
@@ -814,6 +912,12 @@ modify_config() {
                 return
             fi
 
+            if jq -e --argjson port "$NEW_PORT" --argjson idx "$INDEX" '.inbounds[]? | select(.listen_port == $port) | select(. != .inbounds[$idx])' "$CONFIG_FILE" >/dev/null 2>&1; then
+                echo -e "${RED}端口可能已被占用，请换一个。${NC}"
+                pause
+                return
+            fi
+
             TMP=$(mktemp)
             jq --argjson port "$NEW_PORT" ".inbounds[$INDEX].listen_port = \$port" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
         fi
@@ -842,13 +946,15 @@ modify_config() {
 
     if ! check_singbox_config; then
         echo -e "${RED}修改后配置无效，正在回滚。${NC}"
-        cp "$(ls -t ${CONFIG_FILE}.bak.* | head -n1)" "$CONFIG_FILE"
+        BAK=$(latest_backup_file)
+        [ -n "$BAK" ] && cp "$BAK" "$CONFIG_FILE"
         pause
         return
     fi
 
     systemctl restart sing-box
     echo -e "${GREEN}修改已生效。${NC}"
+
     pause
 }
 
@@ -895,13 +1001,15 @@ delete_config() {
 
     if ! check_singbox_config; then
         echo -e "${RED}删除后配置异常，正在回滚。${NC}"
-        cp "$(ls -t ${CONFIG_FILE}.bak.* | head -n1)" "$CONFIG_FILE"
+        BAK=$(latest_backup_file)
+        [ -n "$BAK" ] && cp "$BAK" "$CONFIG_FILE"
         pause
         return
     fi
 
     systemctl restart sing-box
     echo -e "${GREEN}节点已删除。${NC}"
+
     pause
 }
 
@@ -910,19 +1018,26 @@ delete_config() {
 # ==========================================================
 purge_uninstall() {
     clear
-    echo -e "${RED}危险：即将卸载 sing-box、脚本配置、伪装网站。${NC}"
-    read -p "确认？(y/n): " CONFIRM
+    echo -e "${RED}=================================================="
+    echo -e "       危险：即将卸载 sing-box、脚本配置、伪装网站"
+    echo -e "==================================================${NC}"
+
+    read -p "确认卸载？(y/n): " CONFIRM
     [ "$CONFIRM" != "y" ] && return
 
     read -p "是否同时卸载 Nginx？(y/n): " REMOVE_NGINX
 
     systemctl stop sing-box >/dev/null 2>&1
     systemctl disable sing-box >/dev/null 2>&1
+
     rm -f /etc/systemd/system/sing-box.service
     rm -f /usr/local/bin/sing-box
     rm -rf "$CONFIG_DIR"
     rm -rf "$WEB_ROOT"
     rm -f "$NGINX_SITE" "$NGINX_LINK"
+    rm -f /usr/local/bin/sk
+
+    systemctl daemon-reload
 
     if [ "$REMOVE_NGINX" = "y" ]; then
         systemctl stop nginx >/dev/null 2>&1
@@ -933,8 +1048,6 @@ purge_uninstall() {
         systemctl restart nginx >/dev/null 2>&1
     fi
 
-    rm -f /usr/local/bin/sk
-
     echo -e "${GREEN}卸载完成。${NC}"
     exit 0
 }
@@ -943,7 +1056,12 @@ purge_uninstall() {
 # 主菜单
 # ==========================================================
 while true; do
-    init_env
+    if ! init_env; then
+        echo -e "${RED}初始化环境失败，请先修复系统依赖或 APT 源问题。${NC}"
+        pause
+        continue
+    fi
+
     clear
     echo -e "${BLUE}=================================================="
     echo -e "        SkyVault Drive 高级交互式菜单"
