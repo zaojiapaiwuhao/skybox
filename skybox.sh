@@ -1,6 +1,18 @@
 #!/bin/bash
 
-# 终端颜色定义
+# ==========================================================
+# SkyVault Drive + sing-box 管理脚本
+# 功能：
+# 1. 安装/更新 sing-box
+# 2. 添加 Shadowsocks 2022
+# 3. 部署伪装网站 + Webroot 自动证书
+# 4. 添加 VLESS-REALITY 自偷自己伪装站
+# 5. 查看节点和分享链接
+# 6. 修改节点
+# 7. 删除节点
+# 8. 卸载
+# ==========================================================
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -8,85 +20,168 @@ BLUE='\033[0;36m'
 PURPLE='\033[0;35m'
 NC='\033[0m'
 
+CONFIG_DIR="/etc/sing-box"
 CONFIG_FILE="/etc/sing-box/config.json"
 ENV_FILE="/etc/sing-box/script_env.sh"
+WEB_ROOT="/var/www/skyvault-drive"
+NGINX_SITE="/etc/nginx/sites-available/skyvault"
+NGINX_LINK="/etc/nginx/sites-enabled/skyvault"
 
-# 确保以 root 用户运行
+# --------------------------
+# root 检查
+# --------------------------
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}错误：请以 root 用户运行此脚本！${NC}"
     exit 1
 fi
 
-# URL 编码辅助函数
+# --------------------------
+# 通用函数
+# --------------------------
+pause() {
+    read -p "按回车键返回..."
+}
+
+safe_var_name() {
+    echo "$1" | sed 's/[^a-zA-Z0-9_]/_/g'
+}
+
+get_public_ip() {
+    curl -fsS4 https://api.ipify.org 2>/dev/null || curl -fsS4 https://icanhazip.com 2>/dev/null
+}
+
 urlencode() {
-    local string="${1}"
+    local string="$1"
     local strlen=${#string}
     local encoded=""
     local pos c o
-    for (( pos=0 ; pos<strlen ; pos++ )); do
+
+    LC_ALL=C
+    for (( pos=0; pos<strlen; pos++ )); do
         c=${string:$pos:1}
         case "$c" in
-            [-_.~a-zA-Z0-9] ) o="${c}" ;;
-            * )               printf -v o '%%%02x' "$c"
+            [-_.~a-zA-Z0-9])
+                o="$c"
+                ;;
+            *)
+                printf -v o '%%%02X' "'$c"
+                ;;
         esac
-        encoded="${encoded}${o}"
+        encoded+="$o"
     done
-    echo "${encoded}"
+    echo "$encoded"
 }
 
-# 初始化系统环境与必备工具
-init_env() {
-    mkdir -p /etc/sing-box
-    if [ ! -f "$ENV_FILE" ]; then
-        touch "$ENV_FILE"
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+ensure_json() {
+    if [ ! -s "$CONFIG_FILE" ]; then
+        cat > "$CONFIG_FILE" <<EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
     fi
-    source "$ENV_FILE"
+}
+
+check_singbox_config() {
+    if ! command -v sing-box >/dev/null 2>&1; then
+        echo -e "${RED}sing-box 未安装。${NC}"
+        return 1
+    fi
+
+    sing-box check -c "$CONFIG_FILE" >/tmp/singbox_check.log 2>&1
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}sing-box 配置检查失败：${NC}"
+        cat /tmp/singbox_check.log
+        return 1
+    fi
+    return 0
+}
+
+backup_config() {
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%s)"
+}
+
+# --------------------------
+# 初始化环境
+# --------------------------
+init_env() {
+    mkdir -p "$CONFIG_DIR"
+    [ ! -f "$ENV_FILE" ] && touch "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+
+    # shellcheck source=/dev/null
+    source "$ENV_FILE" 2>/dev/null
+
+    local need_install=0
+    for cmd in jq curl wget openssl socat nginx dig fuser cron; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            need_install=1
+        fi
+    done
+
+    if [ "$need_install" -eq 1 ]; then
+        echo -e "${YELLOW}正在安装基础依赖：jq curl wget openssl socat nginx dnsutils cron psmisc...${NC}"
+        apt-get update -y
+        apt-get install -y jq curl wget openssl socat nginx unzip cron psmisc dnsutils ca-certificates
+    fi
+
+    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+    systemctl enable nginx >/dev/null 2>&1
+
+    ensure_json
 
     if [ ! -f /usr/local/bin/sk ]; then
-        ln -sf "$(realpath "$0")" /usr/local/bin/sk
-        chmod +x /usr/local/bin/sk
-    fi
-
-    # 检查并安装基础依赖
-    if ! command -v jq &> /dev/null || ! command -v nginx &> /dev/null; then
-        echo -e "${YELLOW}正在安装系统核心组件 (Nginx, jq, cron, socat, openssl)...${NC}"
-        apt-get update -y
-        apt-get install -y jq curl wget openssl socat nginx unzip cron psmisc
-        mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-        systemctl enable nginx
-        systemctl start nginx
-    fi
-
-    if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ]; then
-        echo '{"log":{"level":"info","timestamp":true},"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}]}' > "$CONFIG_FILE"
+        ln -sf "$(realpath "$0")" /usr/local/bin/sk 2>/dev/null
+        chmod +x /usr/local/bin/sk 2>/dev/null
     fi
 }
 
-# 1. 智能版本校验 + 架构识别部署
+# ==========================================================
+# 1. 安装 / 更新 sing-box
+# ==========================================================
 install_singbox() {
-    echo -e "${BLUE}[1] 开始检查 sing-box 核心环境...${NC}"
-    
-    echo -e "${YELLOW}正在检索 GitHub 最新 Release 版本...${NC}"
-    LATEST_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
-    if [ -z "$LATEST_VER" ] || [ "$LATEST_VER" = "null" ]; then
-        LATEST_VER="1.11.2" 
+    clear
+    echo -e "${BLUE}[1] 安装 / 更新 sing-box 核心${NC}"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        apt-get update -y
+        apt-get install -y jq curl wget tar
     fi
-    
-    if command -v sing-box &> /dev/null; then
-        LOCAL_VER=$(sing-box version 2>&1 | head -n 1 | awk '{print $3}')
-        echo -e "${GREEN}当前本地已安装版本: v${LOCAL_VER}${NC}"
-        echo -e "${GREEN}GitHub 最新发布版本: v${LATEST_VER}${NC}"
-        
+
+    echo -e "${YELLOW}正在获取 GitHub 最新版本...${NC}"
+    LATEST_VER=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r .tag_name | sed 's/^v//')
+
+    if [ -z "$LATEST_VER" ] || [ "$LATEST_VER" = "null" ]; then
+        echo -e "${RED}获取最新版本失败。请检查网络或 GitHub 访问。${NC}"
+        pause
+        return
+    fi
+
+    if command -v sing-box >/dev/null 2>&1; then
+        LOCAL_VER=$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
+        echo -e "${GREEN}本地版本：v${LOCAL_VER}${NC}"
+        echo -e "${GREEN}最新版本：v${LATEST_VER}${NC}"
+
         if [ "$LOCAL_VER" = "$LATEST_VER" ]; then
-            echo -e "${PURPLE}➔ 您的 sing-box 核心已经是最新版本，无需更新。${NC}"
-            read -p "是否强制重新安装？(y/n): " REINSTALL
-            if [ "$REINSTALL" != "y" ]; then
-                read -p "操作已取消，按回车键返回..."
-                return
-            fi
+            read -p "当前已是最新版，是否强制重装？(y/n): " REINSTALL
+            [ "$REINSTALL" != "y" ] && return
         fi
     fi
-    
+
     ARCH=$(uname -m)
     case "$ARCH" in
         x86_64)  SINGBOX_ARCH="linux-amd64" ;;
@@ -94,23 +189,45 @@ install_singbox() {
         armv7l)  SINGBOX_ARCH="linux-armv7" ;;
         *)       SINGBOX_ARCH="linux-amd64" ;;
     esac
-    echo -e "${GREEN}匹配系统架构: ${ARCH} -> ${SINGBOX_ARCH}${NC}"
-    echo -e "${BLUE}目标拉取版本: v${LATEST_VER}${NC}"
-    
-    systemctl stop sing-box &>/dev/null
-    
-    rm -f sing-box.tar.gz
-    wget -O sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-${SINGBOX_ARCH}.tar.gz"
-    
-    if [ -f sing-box.tar.gz ] && [ -s sing-box.tar.gz ]; then
-        tar -zxvf sing-box.tar.gz
-        mv sing-box-*/sing-box /usr/local/bin/
-        rm -rf sing-box*
-        chmod +x /usr/local/bin/sing-box
-        
-        cat <<EOF > /etc/systemd/system/sing-box.service
+
+    echo -e "${GREEN}系统架构：$ARCH -> $SINGBOX_ARCH${NC}"
+
+    TMP_DIR=$(mktemp -d)
+    cd "$TMP_DIR" || return
+
+    DOWNLOAD_URL="https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-${SINGBOX_ARCH}.tar.gz"
+
+    echo -e "${YELLOW}下载：$DOWNLOAD_URL${NC}"
+    if ! wget -O sing-box.tar.gz "$DOWNLOAD_URL"; then
+        echo -e "${RED}下载失败。${NC}"
+        rm -rf "$TMP_DIR"
+        pause
+        return
+    fi
+
+    if ! tar -xzf sing-box.tar.gz; then
+        echo -e "${RED}解压失败。${NC}"
+        rm -rf "$TMP_DIR"
+        pause
+        return
+    fi
+
+    systemctl stop sing-box >/dev/null 2>&1
+
+    if [ ! -f sing-box-*/sing-box ]; then
+        echo -e "${RED}未找到 sing-box 可执行文件。${NC}"
+        rm -rf "$TMP_DIR"
+        pause
+        return
+    fi
+
+    cp sing-box-*/sing-box /usr/local/bin/sing-box
+    chmod +x /usr/local/bin/sing-box
+
+    cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
 Description=sing-box service
+Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
 
 [Service]
@@ -119,222 +236,326 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
 Restart=on-failure
 RestartSec=10s
+LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    else
-        echo -e "${RED}错误：从 GitHub 下载二进制包失败，请检查 VPS 网络！${NC}"
-        read -p "按回车键返回..."
-        return
-    fi
-    
+
+    cd /root || true
+    rm -rf "$TMP_DIR"
+
+    ensure_json
+
     systemctl daemon-reload
-    systemctl enable sing-box
-    systemctl restart sing-box
-    
-    echo -e "${GREEN}sing-box 部署/更新完成！当前实际运行状态：$(systemctl is-active sing-box)${NC}"
-    read -p "按回车键返回..."
+    systemctl enable sing-box >/dev/null 2>&1
+
+    if check_singbox_config; then
+        systemctl restart sing-box
+        echo -e "${GREEN}sing-box 安装/更新完成，状态：$(systemctl is-active sing-box)${NC}"
+    else
+        echo -e "${RED}配置检查失败，未启动 sing-box。${NC}"
+    fi
+
+    pause
 }
 
-# 2. 添加 Shadowsocks 2022 节点
+# ==========================================================
+# 2. 添加 Shadowsocks 2022
+# ==========================================================
 add_ss2022() {
+    clear
     echo -e "${BLUE}[2] 添加 Shadowsocks 2022 节点${NC}"
-    read -p "请输入节点别名标签 (例如 ss-hk): " TAG
-    if [ -z "$TAG" ]; then TAG="SS-2022_$(openssl rand -hex 3)"; fi
-    
-    if jq -e --arg tag "$TAG" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null; then
-        echo -e "${RED}错误：该标签名称已被占用，请输入其他名称！${NC}"
+
+    if ! command -v sing-box >/dev/null 2>&1; then
+        echo -e "${RED}请先安装 sing-box。${NC}"
+        pause
         return
     fi
 
-    read -p "请输入端口 (默认随机): " PORT
-    if [ -z "$PORT" ]; then PORT=$((RANDOM % 55535 + 10000)); fi
+    read -p "请输入节点标签，例如 ss-hk: " TAG
+    [ -z "$TAG" ] && TAG="SS_2022_$(openssl rand -hex 3)"
 
-    echo -e "请选择 Shadowsocks 2022 加密方案:"
-    echo -e " 1) 2022-blake3-aes-128-gcm (轻量高效)"
-    echo -e " 2) 2022-blake3-aes-256-gcm (极致安全 - 默认)"
-    echo -e " 3) 2022-blake3-chacha20-poly1305 (移动端优选)"
+    if jq -e --arg tag "$TAG" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null; then
+        echo -e "${RED}标签已存在。${NC}"
+        pause
+        return
+    fi
+
+    read -p "请输入端口，回车随机: " PORT
+    [ -z "$PORT" ] && PORT=$((RANDOM % 55535 + 10000))
+
+    if ! valid_port "$PORT"; then
+        echo -e "${RED}端口无效。${NC}"
+        pause
+        return
+    fi
+
+    if jq -e --argjson port "$PORT" '.inbounds[]? | select(.listen_port == $port)' "$CONFIG_FILE" >/dev/null; then
+        echo -e "${RED}端口已被已有入站占用。${NC}"
+        pause
+        return
+    fi
+
+    echo "请选择加密方式："
+    echo "1) 2022-blake3-aes-128-gcm"
+    echo "2) 2022-blake3-aes-256-gcm 默认"
+    echo "3) 2022-blake3-chacha20-poly1305"
     read -p "请选择 [1-3]: " METHOD_CHOICE
 
-    case $METHOD_CHOICE in
-        1) 
+    case "$METHOD_CHOICE" in
+        1)
             METHOD="2022-blake3-aes-128-gcm"
-            PASSWORD=$(openssl rand -base64 16)
+            PASSWORD=$(sing-box generate rand --base64 16 2>/dev/null || openssl rand -base64 16)
             ;;
         3)
             METHOD="2022-blake3-chacha20-poly1305"
-            PASSWORD=$(openssl rand -base64 32)
+            PASSWORD=$(sing-box generate rand --base64 32 2>/dev/null || openssl rand -base64 32)
             ;;
         *)
             METHOD="2022-blake3-aes-256-gcm"
-            PASSWORD=$(openssl rand -base64 32)
+            PASSWORD=$(sing-box generate rand --base64 32 2>/dev/null || openssl rand -base64 32)
             ;;
     esac
 
-    jq --argjson new '{"type":"shadowsocks","tag":"'$TAG'","listen":"::","listen_port":'$PORT',"method":"'$METHOD'","password":"'$PASSWORD'"}' \
-       '.inbounds += [$new]' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+    backup_config
+
+    TMP=$(mktemp)
+    jq \
+      --arg tag "$TAG" \
+      --arg method "$METHOD" \
+      --arg password "$PASSWORD" \
+      --argjson port "$PORT" \
+      '.inbounds += [{
+        "type": "shadowsocks",
+        "tag": $tag,
+        "listen": "::",
+        "listen_port": $port,
+        "method": $method,
+        "password": $password
+      }]' "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
+
+    if ! check_singbox_config; then
+        echo -e "${RED}新配置无效，正在回滚。${NC}"
+        cp "$(ls -t ${CONFIG_FILE}.bak.* | head -n1)" "$CONFIG_FILE"
+        pause
+        return
+    fi
 
     systemctl restart sing-box
-    
-    LOCAL_IP=$(curl -s4 icanhazip.com || curl -s4 api.ipify.org)
+
+    LOCAL_IP=$(get_public_ip)
     BASE64_CREDS=$(echo -n "${METHOD}:${PASSWORD}" | base64 | tr -d '\n' | tr -d '=')
     URL_TAG=$(urlencode "$TAG")
     SHARE_LINK="ss://${BASE64_CREDS}@${LOCAL_IP}:${PORT}#${URL_TAG}"
 
-    echo -e "\n${GREEN}✔ Shadowsocks 2022 节点已成功上线并加入核心！${NC}"
-    echo -e "${BLUE}=================================================="
-    echo -e "              📢 新增节点配置详情明细"
-    echo -e "=================================================="
-    echo -e "${PURPLE}协议方案 : Shadowsocks 2022${NC}"
-    echo -e "节点标签 : ${TAG}"
-    echo -e "监听端口 : ${PORT}"
-    echo -e "加密方式 : ${METHOD}"
-    echo -e "专属密钥 : ${PASSWORD}"
-    echo -e "--------------------------------------------------"
-    echo -e "${YELLOW}一键导入分享链接 (直接复制):${NC}"
-    echo -e "${BLUE}${SHARE_LINK}${NC}"
-    echo -e "==================================================\n"
-    
-    read -p "配置已就绪，按回车键返回主菜单..."
+    echo -e "${GREEN}Shadowsocks 2022 节点已添加。${NC}"
+    echo "标签：$TAG"
+    echo "端口：$PORT"
+    echo "加密：$METHOD"
+    echo "密钥：$PASSWORD"
+    echo -e "${YELLOW}分享链接：${NC}"
+    echo "$SHARE_LINK"
+    pause
 }
 
-# 3. 部署 SkyVault Drive 伪装网站 + 申请安全自动续订证书
+# ==========================================================
+# 3. 部署 / 更新 SkyVault Drive 伪装网站
+# ==========================================================
 deploy_website() {
-    echo -e "${BLUE}[3] 部署/更新 SkyVault Drive 伪装网站与 SSL 自动化环境${NC}"
-    read -p "请输入你要绑定的域名 (例如: drive.yourdomain.com): " DOMAIN
-    if [ -z "$DOMAIN" ]; then echo -e "${RED}域名不能为空！${NC}"; return; fi
+    clear
+    echo -e "${BLUE}[3] 部署 / 更新 SkyVault Drive 伪装网站 + SSL${NC}"
 
-    echo -e "${YELLOW}进行全球网络边界解析校验...${NC}"
-    LOCAL_IP=$(curl -s4 icanhazip.com || curl -s4 api.ipify.org)
-    DOMAIN_IP=$(getent ahosts "$DOMAIN" | head -n 1 | awk '{print $1}')
-    if [ "$LOCAL_IP" != "$DOMAIN_IP" ]; then
-        echo -e "${RED}警告：解析出的 IP ($DOMAIN_IP) 与本服务器公网 IP ($LOCAL_IP) 不一致。${NC}"
-        read -p "是否强行继续？(y/n): " FORCE
-        if [ "$FORCE" != "y" ]; then return; fi
-    fi
-
-    sed -i '/MY_DOMAIN=/d' "$ENV_FILE"
-    echo "MY_DOMAIN=\"$DOMAIN\"" >> "$ENV_FILE"
-
-    # 🛠️ 终极防御机制：如果发现系统级的 nginx.conf 被误删，脚本自动补全自愈
-    if [ ! -f /etc/nginx/nginx.conf ]; then
-        echo -e "${YELLOW}警告：检测到系统核心 nginx.conf 丢失，正在自动重构基础骨架...${NC}"
-        mkdir -p /etc/nginx
-        cat << 'EOF' > /etc/nginx/nginx.conf
-user www-data;
-worker_processes auto;
-pid /run/nginx.pid;
-include /etc/nginx/modules-enabled/*.conf;
-
-events {
-    worker_connections 768;
-}
-
-http {
-    sendfile on;
-    tcp_nopush on;
-    types_hash_max_size 2048;
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
-    ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers on;
-    access_log /var/log/nginx/access.log;
-    error_log /var/log/nginx/error.log;
-    gzip on;
-    include /etc/nginx/conf.d/*.conf;
-    include /etc/nginx/sites-enabled/*;
-}
-EOF
-    fi
-
-    # 强行释放 80 端口，停止 Nginx，为独立模式清理赛道
-    echo -e "${YELLOW}正在强行释放 80 端口，暂停占道服务...${NC}"
-    systemctl stop nginx &>/dev/null
-    fuser -k 80/tcp 443/tcp &>/dev/null
-
-    if [ ! -f "$HOME/.acme.sh/acme.sh" ]; then
-        curl https://get.acme.sh | sh -s email="admin@$DOMAIN"
-        source ~/.bashrc
-    fi
-    
-    # 强制全域改用 Let's Encrypt 签发通道
-    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-
-    echo -e "${YELLOW}正在通过 Let's Encrypt 独立服务器模式验证/申请证书...${NC}"
-    ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone
-
-    if [ ! -f "$HOME/.acme.sh/${DOMAIN}_ecc/fullchain.cer" ]; then
-        echo -e "${RED}证书签发依旧失败！${NC}"
-        read -p "按回车键返回..."
+    read -p "请输入绑定域名，例如 drive.example.com: " DOMAIN
+    if [ -z "$DOMAIN" ]; then
+        echo -e "${RED}域名不能为空。${NC}"
+        pause
         return
     fi
 
-    # 证书成功到手后，开始创建前端目录和文件
-    mkdir -p /var/www/skyvault-drive
-    cat << 'EOF' > /var/www/skyvault-drive/index.html
+    LOCAL_IP=$(get_public_ip)
+    DOMAIN_IPS=$(dig +short A "$DOMAIN" | grep -E '^[0-9.]+$')
+
+    echo -e "${YELLOW}本机 IPv4：$LOCAL_IP${NC}"
+    echo -e "${YELLOW}域名 A 记录：${DOMAIN_IPS:-未查询到}${NC}"
+
+    if ! echo "$DOMAIN_IPS" | grep -qx "$LOCAL_IP"; then
+        echo -e "${RED}警告：域名 A 记录未解析到本机 IPv4。${NC}"
+        echo -e "${YELLOW}如果你用了 Cloudflare，请确保该域名为 DNS only / 灰云。${NC}"
+        read -p "是否继续？(y/n): " FORCE
+        [ "$FORCE" != "y" ] && return
+    fi
+
+    sed -i '/^MY_DOMAIN=/d' "$ENV_FILE"
+    echo "MY_DOMAIN=\"$DOMAIN\"" >> "$ENV_FILE"
+
+    mkdir -p "$WEB_ROOT/.well-known/acme-challenge"
+    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+
+    cat > "$WEB_ROOT/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SkyVault Drive - 安全私有云存储</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>SkyVault Drive - Secure Private Storage</title>
+    <style>
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #0f172a;
+            color: #e2e8f0;
+            font-family: Arial, sans-serif;
+        }
+        .card {
+            width: 420px;
+            padding: 36px;
+            border-radius: 24px;
+            background: rgba(15, 23, 42, .86);
+            border: 1px solid rgba(148, 163, 184, .18);
+            box-shadow: 0 30px 80px rgba(0,0,0,.35);
+            text-align: center;
+        }
+        .logo {
+            width: 70px;
+            height: 70px;
+            margin: 0 auto 18px;
+            border-radius: 20px;
+            background: linear-gradient(135deg, #4f46e5, #7c3aed);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 34px;
+        }
+        h1 { margin: 0; font-size: 28px; }
+        p { color: #94a3b8; line-height: 1.7; }
+        input {
+            width: 100%;
+            box-sizing: border-box;
+            margin-top: 12px;
+            padding: 13px;
+            border-radius: 12px;
+            border: 1px solid #334155;
+            background: #020617;
+            color: #e2e8f0;
+        }
+        button {
+            width: 100%;
+            margin-top: 18px;
+            padding: 13px;
+            border: 0;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #4f46e5, #7c3aed);
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .foot {
+            margin-top: 24px;
+            color: #64748b;
+            font-size: 12px;
+        }
+    </style>
 </head>
-<body class="bg-[#0f172a] text-slate-200 font-sans flex items-center justify-center min-h-screen selection:bg-indigo-500 selection:text-white">
-    <div class="absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(99,102,241,0.08),transparent_45%)] pointer-events-none"></div>
-    <div class="absolute inset-0 bg-[linear-gradient(to_bottom,rgba(15,23,42,0.4),#0f172a)] pointer-events-none"></div>
-    <div class="max-w-md w-full bg-slate-900/40 p-8 rounded-2xl shadow-2xl border border-slate-800/80 backdrop-blur-xl relative z-10">
-        <div class="text-center mb-8">
-            <div class="w-16 h-16 bg-gradient-to-tr from-indigo-600 to-violet-500 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-xl shadow-indigo-900/30 border border-indigo-400/20">
-                <svg class="w-8 h-8 text-white animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-            </div>
-            <h2 class="text-2xl font-bold tracking-tight bg-gradient-to-r from-indigo-200 via-slate-100 to-violet-200 bg-clip-text text-transparent">SkyVault Drive</h2>
-            <p class="text-xs text-slate-400 mt-2 font-mono uppercase tracking-widest">分布式加密网关集群</p>
-        </div>
-        <form onsubmit="event.preventDefault(); document.getElementById('btn-txt').innerText='正在验证安全令牌...'; setTimeout(()=>{alert('安全网关鉴权失败：节点拒绝连接'); document.getElementById('btn-txt').innerText='安全验证进入受信任区';}, 1500);" class="space-y-5">
-            <div>
-                <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider">节点签名 (UID)</label>
-                <input type="text" required class="w-full p-3 bg-slate-950/60 border border-slate-800/80 rounded-xl focus:outline-none focus:border-indigo-500 text-slate-200 placeholder-slate-600 text-sm transition-all duration-200" placeholder="storage-node-0x...">
-            </div>
-            <div>
-                <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider">动态令牌密钥 (Cluster Key)</label>
-                <input type="password" required class="w-full mt-1 p-3 bg-slate-950/60 border border-slate-800/80 rounded-xl focus:outline-none focus:border-indigo-500 text-slate-200 placeholder-slate-600 text-sm transition-all duration-200" placeholder="••••••••••••••••">
-            </div>
-            <button type="submit" class="w-full bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white p-3 rounded-xl font-medium transition-all duration-150 shadow-lg border border-indigo-500/20">
-                <span id="btn-txt">安全验证进入受信任区</span>
-            </button>
-        </form>
-        <div class="mt-8 pt-6 border-t border-slate-800/60 flex items-center justify-between text-[11px] text-slate-500 font-mono">
-            <span>STATUS: ENCRYPTED</span>
-            <span>&copy; 2026 SkyVault Infrastructure</span>
-        </div>
-    </div>
+<body>
+<div class="card">
+    <div class="logo">☁</div>
+    <h1>SkyVault Drive</h1>
+    <p>Distributed encrypted storage gateway</p>
+    <form onsubmit="event.preventDefault(); alert('Gateway authentication failed.');">
+        <input placeholder="Node UID" required>
+        <input placeholder="Cluster Key" type="password" required>
+        <button>Enter Secure Area</button>
+    </form>
+    <div class="foot">STATUS: ENCRYPTED · SkyVault Infrastructure</div>
+</div>
 </body>
 </html>
 EOF
 
-    # 写入全新的 Nginx 虚拟主机配置
-    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-    cat << EOF > /etc/nginx/sites-available/default
+    # 先写 HTTP 配置，用于 webroot 申请和续签证书
+    cat > "$NGINX_SITE" <<EOF
 server {
     listen 80;
     listen [::]:80;
     server_name $DOMAIN;
-    return 301 https://\$host\$request_uri;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root $WEB_ROOT;
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+EOF
+
+    ln -sf "$NGINX_SITE" "$NGINX_LINK"
+    rm -f /etc/nginx/sites-enabled/default 2>/dev/null
+
+    if ! nginx -t; then
+        echo -e "${RED}Nginx HTTP 配置检测失败。${NC}"
+        pause
+        return
+    fi
+
+    systemctl restart nginx
+
+    if [ ! -f "$HOME/.acme.sh/acme.sh" ]; then
+        echo -e "${YELLOW}正在安装 acme.sh...${NC}"
+        curl https://get.acme.sh | sh -s email="admin@$DOMAIN"
+    fi
+
+    "$HOME/.acme.sh/acme.sh" --set-default-ca --server letsencrypt
+
+    echo -e "${YELLOW}正在使用 webroot 模式申请 ECC 证书...${NC}"
+    "$HOME/.acme.sh/acme.sh" --issue -d "$DOMAIN" -w "$WEB_ROOT" --keylength ec-256
+
+    if [ ! -f "$HOME/.acme.sh/${DOMAIN}_ecc/fullchain.cer" ]; then
+        echo -e "${RED}证书签发失败。请检查：DNS、80端口、防火墙、域名是否灰云直连。${NC}"
+        pause
+        return
+    fi
+
+    mkdir -p "/etc/nginx/ssl/$DOMAIN"
+
+    "$HOME/.acme.sh/acme.sh" --install-cert -d "$DOMAIN" --ecc \
+        --key-file "/etc/nginx/ssl/$DOMAIN/privkey.key" \
+        --fullchain-file "/etc/nginx/ssl/$DOMAIN/fullchain.cer" \
+        --reloadcmd "systemctl reload nginx"
+
+    # 最终配置：80 用于续签，127.0.0.1:8443 给 Reality 自偷
+    cat > "$NGINX_SITE" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root $WEB_ROOT;
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
 }
 
 server {
     listen 127.0.0.1:8443 ssl;
-    http2 on;
     server_name $DOMAIN;
 
-    ssl_certificate $HOME/.acme.sh/${DOMAIN}_ecc/fullchain.cer;
-    ssl_certificate_key $HOME/.acme.sh/${DOMAIN}_ecc/${DOMAIN}.key;
+    ssl_certificate /etc/nginx/ssl/$DOMAIN/fullchain.cer;
+    ssl_certificate_key /etc/nginx/ssl/$DOMAIN/privkey.key;
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
 
-    root /var/www/skyvault-drive;
+    root $WEB_ROOT;
     index index.html;
 
     location / {
@@ -342,276 +563,405 @@ server {
     }
 }
 EOF
-    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
-    
-    echo -e "${YELLOW}正在拉起并检测 Nginx 状态...${NC}"
-    systemctl restart nginx
-    
-    if ! systemctl is-active nginx &>/dev/null; then
-        echo -e "${RED}出错了！Nginx 依然无法正常启动。下面是系统环境抛出的底层错误：${NC}"
-        nginx -t
-        read -p "请保留上述错误截图并按回车键返回..."
+
+    if ! nginx -t; then
+        echo -e "${RED}Nginx SSL 配置检测失败。${NC}"
+        pause
         return
     fi
 
-    echo -e "${GREEN}SkyVault Drive 伪装系统已经自动就绪！${NC}"
-    read -p "按回车键返回..."
+    systemctl restart nginx
+
+    echo -e "${GREEN}SkyVault Drive 伪装站部署完成。${NC}"
+    echo -e "${YELLOW}说明：Nginx 的 HTTPS 只监听 127.0.0.1:8443。公网 443 将由 sing-box Reality 接管。${NC}"
+    pause
 }
 
-# 4. 添加 VLESS-REALITY 节点
+# ==========================================================
+# 4. 添加 VLESS-REALITY 自偷节点
+# ==========================================================
 add_vless_reality() {
-    echo -e "${BLUE}[4] 添加 VLESS-Reality 自偷节点${NC}"
-    source "$ENV_FILE"
-    if [ -z "$MY_DOMAIN" ]; then
-        echo -e "${YELLOW}由于未检测到已绑定的伪装静态站，请输入外部可访问域名。${NC}"
-        read -p "请输入伪装绑定的域名: " MY_DOMAIN
-        if [ -z "$MY_DOMAIN" ]; then return; fi
+    clear
+    echo -e "${BLUE}[4] 添加 VLESS-REALITY 自偷节点${NC}"
+
+    if ! command -v sing-box >/dev/null 2>&1; then
+        echo -e "${RED}请先安装 sing-box。${NC}"
+        pause
+        return
     fi
 
-    read -p "请输入节点别名标签 (例如 vless-reality): " TAG
-    if [ -z "$TAG" ]; then TAG="VLESS-Reality_$(openssl rand -hex 3)"; fi
+    # shellcheck source=/dev/null
+    source "$ENV_FILE" 2>/dev/null
+
+    if [ -z "$MY_DOMAIN" ]; then
+        echo -e "${YELLOW}未检测到已部署域名。${NC}"
+        read -p "请输入用于自偷的域名: " MY_DOMAIN
+        [ -z "$MY_DOMAIN" ] && return
+    fi
+
+    if [ ! -f "/etc/nginx/ssl/$MY_DOMAIN/fullchain.cer" ]; then
+        echo -e "${RED}未找到该域名证书，请先执行第 3 步部署伪装网站。${NC}"
+        pause
+        return
+    fi
+
+    read -p "请输入节点标签，例如 vless_reality: " TAG
+    [ -z "$TAG" ] && TAG="VLESS_Reality_$(openssl rand -hex 3)"
 
     if jq -e --arg tag "$TAG" '.inbounds[]? | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null; then
-        echo -e "${RED}错误：该标签名称已被占用！${NC}"
+        echo -e "${RED}标签已存在。${NC}"
+        pause
+        return
+    fi
+
+    if jq -e '.inbounds[]? | select(.listen_port == 443)' "$CONFIG_FILE" >/dev/null; then
+        echo -e "${RED}已有入站占用 443。Reality 自偷模式建议只保留一个公网 443 入站。${NC}"
+        pause
         return
     fi
 
     UUID=$(sing-box generate uuid)
     KEYPAIR=$(sing-box generate reality-keypair)
-    PRIVATE_KEY=$(echo "$KEYPAIR" | grep "PrivateKey" | awk '{print $2}')
-    PUBLIC_KEY=$(echo "$KEYPAIR" | grep "PublicKey" | awk '{print $2}')
+    PRIVATE_KEY=$(echo "$KEYPAIR" | grep -i "PrivateKey" | awk '{print $2}')
+    PUBLIC_KEY=$(echo "$KEYPAIR" | grep -i "PublicKey" | awk '{print $2}')
     SHORT_ID=$(openssl rand -hex 8)
 
-    jq --argjson new '{
+    if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+        echo -e "${RED}Reality 密钥生成失败。${NC}"
+        pause
+        return
+    fi
+
+    backup_config
+
+    TMP=$(mktemp)
+    jq \
+      --arg tag "$TAG" \
+      --arg uuid "$UUID" \
+      --arg domain "$MY_DOMAIN" \
+      --arg private_key "$PRIVATE_KEY" \
+      --arg short_id "$SHORT_ID" \
+      '.inbounds += [{
         "type": "vless",
-        "tag": "'"$TAG"'",
+        "tag": $tag,
         "listen": "::",
         "listen_port": 443,
         "sniff": true,
         "sniff_override_destination": true,
-        "users": [{"uuid": "'"$UUID"'","flow": "xtls-rprx-vision"}],
+        "users": [
+          {
+            "uuid": $uuid,
+            "flow": "xtls-rprx-vision"
+          }
+        ],
         "tls": {
+          "enabled": true,
+          "server_name": $domain,
+          "reality": {
             "enabled": true,
-            "server_name": "'"$MY_DOMAIN"'",
-            "reality": {
-                "enabled": true,
-                "handshake": {"server": "127.0.0.1","server_port": 8443},
-                "private_key": "'"$PRIVATE_KEY"'",
-                "short_id": ["'"$SHORT_ID"'"]
-            }
+            "handshake": {
+              "server": "127.0.0.1",
+              "server_port": 8443
+            },
+            "private_key": $private_key,
+            "short_id": [
+              $short_id
+            ]
+          }
         }
-    }' '.inbounds += [$new]' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+      }]' "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
 
-    echo "${TAG}_PUBLIC_KEY=\"$PUBLIC_KEY\"" >> "$ENV_FILE"
-    echo "${TAG}_SHORT_ID=\"$SHORT_ID\"" >> "$ENV_FILE"
+    SAFE_TAG=$(safe_var_name "$TAG")
+    sed -i "/^${SAFE_TAG}_PUBLIC_KEY=/d" "$ENV_FILE"
+    sed -i "/^${SAFE_TAG}_SHORT_ID=/d" "$ENV_FILE"
+    echo "${SAFE_TAG}_PUBLIC_KEY=\"$PUBLIC_KEY\"" >> "$ENV_FILE"
+    echo "${SAFE_TAG}_SHORT_ID=\"$SHORT_ID\"" >> "$ENV_FILE"
+
+    if ! check_singbox_config; then
+        echo -e "${RED}新配置无效，正在回滚。${NC}"
+        cp "$(ls -t ${CONFIG_FILE}.bak.* | head -n1)" "$CONFIG_FILE"
+        sed -i "/^${SAFE_TAG}_PUBLIC_KEY=/d" "$ENV_FILE"
+        sed -i "/^${SAFE_TAG}_SHORT_ID=/d" "$ENV_FILE"
+        pause
+        return
+    fi
 
     systemctl restart sing-box
-    
+
+    if ! systemctl is-active sing-box >/dev/null 2>&1; then
+        echo -e "${RED}sing-box 启动失败，请查看日志：journalctl -u sing-box -e${NC}"
+        pause
+        return
+    fi
+
     URL_TAG=$(urlencode "$TAG")
     SHARE_LINK="vless://${UUID}@${MY_DOMAIN}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${MY_DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp#${URL_TAG}"
 
-    echo -e "\n${GREEN}✔ VLESS-Reality 自偷合并架构创建成功！${NC}"
-    echo -e "${BLUE}=================================================="
-    echo -e "              📢 新增节点配置详情明细"
-    echo -e "=================================================="
-    echo -e "${PURPLE}协议方案 : VLESS + XTLS-Vision + Reality${NC}"
-    echo -e "节点标签 : ${TAG}"
-    echo -e "外网端口 : 443 (标准 HTTPS 安全入站)"
-    echo -e "用户UUID : ${UUID}"
-    echo -e "自偷目标 : ${MY_DOMAIN}"
-    echo -e "公钥参数 : ${PUBLIC_KEY}"
-    echo -e "短标识符 : ${SHORT_ID}"
-    echo -e "--------------------------------------------------"
-    echo -e "${YELLOW}一键导入分享链接 (直接复制):${NC}"
-    echo -e "${BLUE}${SHARE_LINK}${NC}"
-    echo -e "==================================================\n"
-    
-    read -p "配置已就绪，按回车键返回主菜单..."
+    echo -e "${GREEN}VLESS-REALITY 自偷节点创建成功。${NC}"
+    echo "标签：$TAG"
+    echo "域名/SNI：$MY_DOMAIN"
+    echo "端口：443"
+    echo "UUID：$UUID"
+    echo "PublicKey：$PUBLIC_KEY"
+    echo "ShortID：$SHORT_ID"
+    echo -e "${YELLOW}分享链接：${NC}"
+    echo "$SHARE_LINK"
+    pause
 }
 
-# 5. 查看配置与一键通用链接 URL
+# ==========================================================
+# 5. 查看配置和分享链接
+# ==========================================================
 view_configs() {
     clear
-    echo -e "${BLUE}=================================================="
-    echo -e "       当前活跃代理集群节点配置与一键分享链接"
-    echo -e "==================================================${NC}"
-    source "$ENV_FILE"
-    LOCAL_IP=$(curl -s4 icanhazip.com || curl -s4 api.ipify.org)
+    echo -e "${BLUE}当前节点配置与分享链接${NC}"
+
+    # shellcheck source=/dev/null
+    source "$ENV_FILE" 2>/dev/null
+
+    LOCAL_IP=$(get_public_ip)
+    LENGTH=$(jq '.inbounds | length' "$CONFIG_FILE")
+
+    if [ "$LENGTH" -eq 0 ]; then
+        echo -e "${YELLOW}暂无节点。${NC}"
+        pause
+        return
+    fi
+
+    for ((i=0; i<LENGTH; i++)); do
+        TYPE=$(jq -r ".inbounds[$i].type" "$CONFIG_FILE")
+        TAG=$(jq -r ".inbounds[$i].tag" "$CONFIG_FILE")
+        PORT=$(jq -r ".inbounds[$i].listen_port" "$CONFIG_FILE")
+
+        echo -e "${PURPLE}[$i] $TAG ($TYPE)${NC}"
+
+        if [ "$TYPE" = "shadowsocks" ]; then
+            METHOD=$(jq -r ".inbounds[$i].method" "$CONFIG_FILE")
+            PASSWORD=$(jq -r ".inbounds[$i].password" "$CONFIG_FILE")
+            BASE64_CREDS=$(echo -n "${METHOD}:${PASSWORD}" | base64 | tr -d '\n' | tr -d '=')
+            URL_TAG=$(urlencode "$TAG")
+            LINK="ss://${BASE64_CREDS}@${LOCAL_IP}:${PORT}#${URL_TAG}"
+
+            echo "端口：$PORT"
+            echo "加密：$METHOD"
+            echo "密钥：$PASSWORD"
+            echo -e "${YELLOW}链接：$LINK${NC}"
+
+        elif [ "$TYPE" = "vless" ]; then
+            UUID=$(jq -r ".inbounds[$i].users[0].uuid" "$CONFIG_FILE")
+            DOMAIN=$(jq -r ".inbounds[$i].tls.server_name" "$CONFIG_FILE")
+
+            SAFE_TAG=$(safe_var_name "$TAG")
+            eval PUB_KEY="\$${SAFE_TAG}_PUBLIC_KEY"
+            eval SID="\$${SAFE_TAG}_SHORT_ID"
+
+            if [ -z "$PUB_KEY" ] || [ -z "$SID" ]; then
+                echo -e "${RED}警告：未找到 PublicKey 或 ShortID，可能环境文件被清理。${NC}"
+            else
+                URL_TAG=$(urlencode "$TAG")
+                LINK="vless://${UUID}@${DOMAIN}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUB_KEY}&sid=${SID}&type=tcp#${URL_TAG}"
+                echo "端口：443"
+                echo "UUID：$UUID"
+                echo "SNI：$DOMAIN"
+                echo -e "${YELLOW}链接：$LINK${NC}"
+            fi
+        fi
+
+        echo "--------------------------------------------------"
+    done
+
+    pause
+}
+
+# ==========================================================
+# 6. 修改节点
+# ==========================================================
+modify_config() {
+    clear
+    echo -e "${BLUE}[6] 修改节点${NC}"
 
     LENGTH=$(jq '.inbounds | length' "$CONFIG_FILE")
     if [ "$LENGTH" -eq 0 ]; then
-        echo -e "${YELLOW}暂时未检测到任何正在运转的代理入口。${NC}"
-    else
-        for ((i=0; i<LENGTH; i++)); do
-            TYPE=$(jq -r ".inbounds[$i].type" "$CONFIG_FILE")
-            TAG=$(jq -r ".inbounds[$i].tag" "$CONFIG_FILE")
-            PORT=$(jq -r ".inbounds[$i].listen_port" "$CONFIG_FILE")
-            
-            echo -e "${PURPLE}节点索引: $i | 协议: [${TYPE}] | 标签: [${TAG}]${NC}"
-            
-            if [ "$TYPE" = "shadowsocks" ]; then
-                METHOD=$(jq -r ".inbounds[$i].method" "$CONFIG_FILE")
-                PASSWORD=$(jq -r ".inbounds[$i].password" "$CONFIG_FILE")
-                
-                BASE64_CREDS=$(echo -n "${METHOD}:${PASSWORD}" | base64 | tr -d '\n' | tr -d '=')
-                URL_TAG=$(urlencode "$TAG")
-                SHARE_LINK="ss://${BASE64_CREDS}@${LOCAL_IP}:${PORT}#${URL_TAG}"
-                
-                echo -e "  - 端口: $PORT | 加密: $METHOD"
-                echo -e "  - 密钥: $PASSWORD"
-                echo -e "  - ${YELLOW}一键链接: ${SHARE_LINK}${NC}"
-                
-            elif [ "$TYPE" = "vless" ]; then
-                UUID=$(jq -r ".inbounds[$i].users[0].uuid" "$CONFIG_FILE")
-                DOMAIN=$(jq -r ".inbounds[$i].tls.server_name" "$CONFIG_FILE")
-                
-                eval PUB_KEY="\$${TAG}_PUBLIC_KEY"
-                eval SID="\$${TAG}_SHORT_ID"
-                
-                if [ -z "$PUB_KEY" ]; then PUB_KEY="未找到对应公钥"; fi
-                if [ -z "$SID" ]; then SID="未找到ShortID"; fi
-                
-                URL_TAG=$(urlencode "$TAG")
-                SHARE_LINK="vless://${UUID}@${DOMAIN}:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${DOMAIN}&fp=chrome&pbk=${PUB_KEY}&sid=${SID}&type=tcp#${URL_TAG}"
-                
-                echo -e "  - 端口: 443 | 伪装映射SNI: $DOMAIN"
-                echo -e "  - 用户UUID: $UUID"
-                echo -e "  - ${YELLOW}一键链接: ${SHARE_LINK}${NC}"
-            fi
-            echo -e "--------------------------------------------------"
-        done
+        echo -e "${YELLOW}暂无节点可修改。${NC}"
+        pause
+        return
     fi
-    read -p "按回车键返回..."
-}
-
-# 6. 更改配置
-modify_config() {
-    echo -e "${BLUE}[6] 动态修改现有节点配置${NC}"
-    LENGTH=$(jq '.inbounds | length' "$CONFIG_FILE")
-    if [ "$LENGTH" -eq 0 ]; then echo -e "${YELLOW}无任何节点可供修改！${NC}"; return; fi
 
     for ((i=0; i<LENGTH; i++)); do
         TAG=$(jq -r ".inbounds[$i].tag" "$CONFIG_FILE")
         TYPE=$(jq -r ".inbounds[$i].type" "$CONFIG_FILE")
-        echo -e "  $i) 标签: [$TAG] ($TYPE)"
+        echo "$i) $TAG ($TYPE)"
     done
-    
-    read -p "请选择你想要修改的节点索引数字: " INDEX
-    if [ -z "$INDEX" ] || ! [[ "$INDEX" =~ ^[0-9]+$ ]] || [ "$INDEX" -ge "$LENGTH" ]; then
-        echo -e "${RED}无效的选择。${NC}"
+
+    read -p "请选择索引: " INDEX
+    if ! [[ "$INDEX" =~ ^[0-9]+$ ]] || [ "$INDEX" -ge "$LENGTH" ]; then
+        echo -e "${RED}无效索引。${NC}"
+        pause
         return
     fi
 
     TYPE=$(jq -r ".inbounds[$INDEX].type" "$CONFIG_FILE")
-    TAG=$(jq -r ".inbounds[$INDEX].tag" "$CONFIG_FILE")
+
+    backup_config
 
     if [ "$TYPE" = "shadowsocks" ]; then
-        read -p "请输入全新的端口 (回车保持原样): " NEW_PORT
+        read -p "新端口，回车不改: " NEW_PORT
+
         if [ -n "$NEW_PORT" ]; then
-            jq ".inbounds[$INDEX].listen_port = $NEW_PORT" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            if ! valid_port "$NEW_PORT"; then
+                echo -e "${RED}端口无效。${NC}"
+                pause
+                return
+            fi
+
+            TMP=$(mktemp)
+            jq --argjson port "$NEW_PORT" ".inbounds[$INDEX].listen_port = \$port" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
         fi
-        read -p "是否需要重置随机安全密钥密码？(y/n): " RESET_PASS
+
+        read -p "是否重置密码？(y/n): " RESET_PASS
         if [ "$RESET_PASS" = "y" ]; then
             METHOD=$(jq -r ".inbounds[$INDEX].method" "$CONFIG_FILE")
-            if [ "$METHOD" = "2022-blake3-aes-128-gcm" ]; then NEW_P=$(openssl rand -base64 16); else NEW_P=$(openssl rand -base64 32); fi
-            jq ".inbounds[$INDEX].password = \"$NEW_P\"" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            if [ "$METHOD" = "2022-blake3-aes-128-gcm" ]; then
+                NEW_PASS=$(sing-box generate rand --base64 16 2>/dev/null || openssl rand -base64 16)
+            else
+                NEW_PASS=$(sing-box generate rand --base64 32 2>/dev/null || openssl rand -base64 32)
+            fi
+
+            TMP=$(mktemp)
+            jq --arg pass "$NEW_PASS" ".inbounds[$INDEX].password = \$pass" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
         fi
+
     elif [ "$TYPE" = "vless" ]; then
-        read -p "是否重置该 Reality 节点的全局用户验证 UUID？(y/n): " RESET_UUID
+        read -p "是否重置 UUID？(y/n): " RESET_UUID
         if [ "$RESET_UUID" = "y" ]; then
             NEW_UUID=$(sing-box generate uuid)
-            jq ".inbounds[$INDEX].users[0].uuid = \"$NEW_UUID\"" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            TMP=$(mktemp)
+            jq --arg uuid "$NEW_UUID" ".inbounds[$INDEX].users[0].uuid = \$uuid" "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
         fi
     fi
 
+    if ! check_singbox_config; then
+        echo -e "${RED}修改后配置无效，正在回滚。${NC}"
+        cp "$(ls -t ${CONFIG_FILE}.bak.* | head -n1)" "$CONFIG_FILE"
+        pause
+        return
+    fi
+
     systemctl restart sing-box
-    echo -e "${GREEN}节点修改生效，核心已平滑重启！${NC}"
-    read -p "按回车键返回..."
+    echo -e "${GREEN}修改已生效。${NC}"
+    pause
 }
 
-# 7. 一键删除指定节点
+# ==========================================================
+# 7. 删除节点
+# ==========================================================
 delete_config() {
-    echo -e "${BLUE}[7] 删除指定入站代理节点${NC}"
+    clear
+    echo -e "${BLUE}[7] 删除节点${NC}"
+
     LENGTH=$(jq '.inbounds | length' "$CONFIG_FILE")
-    if [ "$LENGTH" -eq 0 ]; then echo -e "${YELLOW}核心内目前十分干净，无需清理。${NC}"; return; fi
+    if [ "$LENGTH" -eq 0 ]; then
+        echo -e "${YELLOW}暂无节点。${NC}"
+        pause
+        return
+    fi
 
     for ((i=0; i<LENGTH; i++)); do
         TAG=$(jq -r ".inbounds[$i].tag" "$CONFIG_FILE")
         TYPE=$(jq -r ".inbounds[$i].type" "$CONFIG_FILE")
-        echo -e "  $i) 标签名: [$TAG] (类型: $TYPE)"
+        echo "$i) $TAG ($TYPE)"
     done
 
-    read -p "请输入你想彻底移除的节点索引数字: " DEL_INDEX
-    if [ -z "$DEL_INDEX" ] || ! [[ "$DEL_INDEX" =~ ^[0-9]+$ ]] || [ "$DEL_INDEX" -ge "$LENGTH" ]; then
-        echo -e "${RED}取消删除，输入无效。${NC}"
+    read -p "请输入要删除的索引: " DEL_INDEX
+    if ! [[ "$DEL_INDEX" =~ ^[0-9]+$ ]] || [ "$DEL_INDEX" -ge "$LENGTH" ]; then
+        echo -e "${RED}无效索引。${NC}"
+        pause
         return
     fi
 
     TARGET_TAG=$(jq -r ".inbounds[$DEL_INDEX].tag" "$CONFIG_FILE")
-    jq --arg tag "$TARGET_TAG" 'del(.inbounds[] | select(.tag == $tag))' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-    
-    sed -i "/${TARGET_TAG}_PUBLIC_KEY=/d" "$ENV_FILE"
-    sed -i "/${TARGET_TAG}_SHORT_ID=/d" "$ENV_FILE"
+    SAFE_TAG=$(safe_var_name "$TARGET_TAG")
 
-    systemctl restart sing-box
-    echo -e "${GREEN}节点 [$TARGET_TAG] 已成功移出集群！${NC}"
-    read -p "按回车键返回..."
-}
+    read -p "确认删除 [$TARGET_TAG]？(y/n): " CONFIRM
+    [ "$CONFIRM" != "y" ] && return
 
-# 8. 🔥 全场景无缝卸载
-purge_uninstall() {
-    clear
-    echo -e "${RED}=================================================="
-    echo -e "       ⚠️ 警告：您正在调用深度强制卸载程序 ⚠️"
-    echo -e "=================================================="
-    read -p "确认要将环境卸载得一干二净吗？请输入 (y/n): " PURGE_CONFIRM
-    if [ "$PURGE_CONFIRM" != "y" ]; then return; fi
+    backup_config
 
-    read -p "是否同时彻底卸载 Nginx 核心组件？(y/n): " PURGE_NGINX_CONFIRM
+    TMP=$(mktemp)
+    jq --arg tag "$TARGET_TAG" 'del(.inbounds[] | select(.tag == $tag))' "$CONFIG_FILE" > "$TMP" && mv "$TMP" "$CONFIG_FILE"
 
-    systemctl stop sing-box &>/dev/null
-    systemctl disable sing-box &>/dev/null
-    rm -f /etc/systemd/system/sing-box.service /usr/local/bin/sing-box
-    rm -rf /etc/sing-box /var/www/skyvault-drive
+    sed -i "/^${SAFE_TAG}_PUBLIC_KEY=/d" "$ENV_FILE"
+    sed -i "/^${SAFE_TAG}_SHORT_ID=/d" "$ENV_FILE"
 
-    if [ "$PURGE_NGINX_CONFIRM" = "y" ]; then
-        systemctl stop nginx &>/dev/null
-        apt-get purge -y nginx nginx-common nginx-core &>/dev/null
-        apt-get autoremove -y &>/dev/null
-        rm -rf /etc/nginx /var/log/nginx
+    if ! check_singbox_config; then
+        echo -e "${RED}删除后配置异常，正在回滚。${NC}"
+        cp "$(ls -t ${CONFIG_FILE}.bak.* | head -n1)" "$CONFIG_FILE"
+        pause
+        return
     fi
 
-    if [ -f "$HOME/.acme.sh/acme.sh" ]; then
-        ~/.acme.sh/acme.sh --uninstall &>/dev/null
-        rm -rf "$HOME/.acme.sh"
+    systemctl restart sing-box
+    echo -e "${GREEN}节点已删除。${NC}"
+    pause
+}
+
+# ==========================================================
+# 8. 卸载
+# ==========================================================
+purge_uninstall() {
+    clear
+    echo -e "${RED}危险：即将卸载 sing-box、脚本配置、伪装网站。${NC}"
+    read -p "确认？(y/n): " CONFIRM
+    [ "$CONFIRM" != "y" ] && return
+
+    read -p "是否同时卸载 Nginx？(y/n): " REMOVE_NGINX
+
+    systemctl stop sing-box >/dev/null 2>&1
+    systemctl disable sing-box >/dev/null 2>&1
+    rm -f /etc/systemd/system/sing-box.service
+    rm -f /usr/local/bin/sing-box
+    rm -rf "$CONFIG_DIR"
+    rm -rf "$WEB_ROOT"
+    rm -f "$NGINX_SITE" "$NGINX_LINK"
+
+    if [ "$REMOVE_NGINX" = "y" ]; then
+        systemctl stop nginx >/dev/null 2>&1
+        apt-get purge -y nginx nginx-common nginx-core >/dev/null 2>&1
+        apt-get autoremove -y >/dev/null 2>&1
+        rm -rf /etc/nginx /var/log/nginx
+    else
+        systemctl restart nginx >/dev/null 2>&1
     fi
 
     rm -f /usr/local/bin/sk
-    rm -f "$0"
-    echo -e "${GREEN}环境已完全彻底清空自毁！${NC}"
+
+    echo -e "${GREEN}卸载完成。${NC}"
     exit 0
 }
 
-# 核心控制台菜单循环
+# ==========================================================
+# 主菜单
+# ==========================================================
 while true; do
-    clear
     init_env
+    clear
     echo -e "${BLUE}=================================================="
-    echo -e "        SkyVault Drive 核心高级交互式菜单"
-    echo -e "=================================================="
-    echo -e " ${GREEN}1)${NC} 安装 / 更新 sing-box 核心环境 (带版本智能校验)"
-    echo -e " ${GREEN}2)${NC} 添加 Shadowsocks 2022 节点 (多加密可选)"
-    echo -e " ${GREEN}3)${NC} 部署 / 更新 SkyVault Drive 伪装网站 (全自动SSL)"
-    echo -e " ${GREEN}4)${NC} 添加 VLESS-REALITY 节点 (自偷混淆模式)"
-    echo -e " ${YELLOW}5) 查看现有节点配置与一键分享链接 (URL)${NC}"
-    echo -e " ${BLUE}6) 更改/修改现有节点参数${NC}"
-    echo -e " ${PURPLE}7) 删除指定不需要的代理节点${NC}"
-    echo -e " ${RED}8) 🚨 一键彻底卸载面板、环境、定时任务、Nginx与脚本自毁 (干净利落)${NC}"
-    echo -e " ${PLAIN}0) 优雅安全退出脚本${NC}"
+    echo -e "        SkyVault Drive 高级交互式菜单"
+    echo -e "==================================================${NC}"
+    echo -e " ${GREEN}1)${NC} 安装 / 更新 sing-box 核心"
+    echo -e " ${GREEN}2)${NC} 添加 Shadowsocks 2022 节点"
+    echo -e " ${GREEN}3)${NC} 部署 / 更新 SkyVault Drive 伪装网站 + SSL"
+    echo -e " ${GREEN}4)${NC} 添加 VLESS-REALITY 节点，自偷第 3 步伪装站"
+    echo -e " ${YELLOW}5)${NC} 查看节点配置与分享链接"
+    echo -e " ${BLUE}6)${NC} 修改现有节点"
+    echo -e " ${PURPLE}7)${NC} 删除节点"
+    echo -e " ${RED}8)${NC} 卸载环境"
+    echo -e " 0) 退出"
     echo -e "${BLUE}==================================================${NC}"
+
     read -p "请选择操作 [0-8]: " CHOICE
 
-    case $CHOICE in
+    case "$CHOICE" in
         1) install_singbox ;;
         2) add_ss2022 ;;
         3) deploy_website ;;
@@ -621,6 +971,6 @@ while true; do
         7) delete_config ;;
         8) purge_uninstall ;;
         0) clear; exit 0 ;;
-        *) echo -e "${RED}输入错误！${NC}" && sleep 1 ;;
+        *) echo -e "${RED}输入错误。${NC}"; sleep 1 ;;
     esac
 done
