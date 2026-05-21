@@ -42,7 +42,7 @@ init_env() {
     fi
     source "$ENV_FILE"
 
-    # ✨【快捷键降维打击】改用系统级软链接，无需 source，瞬间全域生效
+    # ✨ 改用系统级软链接，无需 source，瞬间全域生效
     if [ ! -f /usr/local/bin/sk ]; then
         ln -sf "$(realpath "$0")" /usr/local/bin/sk
         chmod +x /usr/local/bin/sk
@@ -53,6 +53,7 @@ init_env() {
         echo -e "${YELLOW}正在安装系统核心组件 (Nginx, jq, cron, socat, openssl)...${NC}"
         apt-get update -y
         apt-get install -y jq curl wget openssl socat nginx unzip cron
+        mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
         systemctl enable nginx
         systemctl start nginx
     fi
@@ -67,14 +68,12 @@ init_env() {
 install_singbox() {
     echo -e "${BLUE}[1] 开始检查 sing-box 核心环境...${NC}"
     
-    # 获取 GitHub 最新稳定版版本号
     echo -e "${YELLOW}正在检索 GitHub 最新 Release 版本...${NC}"
     LATEST_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/v//')
     if [ -z "$LATEST_VER" ] || [ "$LATEST_VER" = "null" ]; then
-        LATEST_VER="1.11.2" # 生产保底版本
+        LATEST_VER="1.11.2" 
     fi
     
-    # 本地版本校验逻辑
     if command -v sing-box &> /dev/null; then
         LOCAL_VER=$(sing-box version 2>&1 | head -n 1 | awk '{print $3}')
         echo -e "${GREEN}当前本地已安装版本: v${LOCAL_VER}${NC}"
@@ -90,7 +89,6 @@ install_singbox() {
         fi
     fi
     
-    # ⚡ 智能架构自动识别
     ARCH=$(uname -m)
     case "$ARCH" in
         x86_64)  SINGBOX_ARCH="linux-amd64" ;;
@@ -101,10 +99,8 @@ install_singbox() {
     echo -e "${GREEN}匹配系统架构: ${ARCH} -> ${SINGBOX_ARCH}${NC}"
     echo -e "${BLUE}目标拉取版本: v${LATEST_VER}${NC}"
     
-    # 停止旧服务防止文件占用
     systemctl stop sing-box &>/dev/null
     
-    # 下载并部署
     rm -f sing-box.tar.gz
     wget -O sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-${SINGBOX_ARCH}.tar.gz"
     
@@ -114,7 +110,6 @@ install_singbox() {
         rm -rf sing-box*
         chmod +x /usr/local/bin/sing-box
         
-        # 建立标准 Systemd 守护进程服务
         cat <<EOF > /etc/systemd/system/sing-box.service
 [Unit]
 Description=sing-box service
@@ -136,7 +131,6 @@ EOF
         return
     fi
     
-    # 刷新服务并启动核心
     systemctl daemon-reload
     systemctl enable sing-box
     systemctl restart sing-box
@@ -225,6 +219,8 @@ deploy_website() {
     sed -i '/MY_DOMAIN=/d' "$ENV_FILE"
     echo "MY_DOMAIN=\"$DOMAIN\"" >> "$ENV_FILE"
 
+    # 修复点 1：确保 Nginx 核心配置目录树必须存在
+    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
     mkdir -p /var/www/skyvault-drive/.well-known/acme-challenge
 
     cat << EOF > /etc/nginx/sites-available/default
@@ -238,6 +234,8 @@ server {
     }
 }
 EOF
+    # 建立软链接确保 Nginx 能够正确载入它
+    ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
     systemctl restart nginx
 
     if [ ! -f "$HOME/.acme.sh/acme.sh" ]; then
@@ -245,7 +243,8 @@ EOF
         source ~/.bashrc
     fi
     
-    ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --webroot /var/www/skyvault-drive --tailscale no --non-interactive
+    # 修复点 2：剔除不受支持的 --tailscale no 参数，还原最稳固的验证流
+    ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --webroot /var/www/skyvault-drive --non-interactive
 
     if [ ! -f "$HOME/.acme.sh/${DOMAIN}_ecc/fullchain.cer" ]; then
         echo -e "${RED}证书签发失败！请确认 80 端口无占用且防火墙已放行。${NC}"
@@ -276,7 +275,7 @@ EOF
             <p class="text-xs text-slate-400 mt-2 font-mono uppercase tracking-widest">分布式加密网关集群</p>
         </div>
         
-        <form onsubmit="event.preventDefault(); document.getElementById('btn-txt').innerText='正在验证安全令牌...'; setTimeout(()=>{alert('安全网关鉴学失败：节点拒绝连接'); document.getElementById('btn-txt').innerText='安全验证进入受信任区';}, 1500);" class="space-y-5">
+        <form onsubmit="event.preventDefault(); document.getElementById('btn-txt').innerText='正在验证安全令牌...'; setTimeout(()=>{alert('安全网关鉴权失败：节点拒绝连接'); document.getElementById('btn-txt').innerText='安全验证进入受信任区';}, 1500);" class="space-y-5">
             <div>
                 <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider">节点签名 (UID)</label>
                 <div class="mt-1 relative">
@@ -575,7 +574,6 @@ purge_uninstall() {
     echo -e "${YELLOW}[*] 正在执行全套清场轰炸...${NC}"
     source "$ENV_FILE" 2>/dev/null
 
-    # 1. 关停并根除 sing-box 进程服务
     systemctl stop sing-box &>/dev/null
     systemctl disable sing-box &>/dev/null
     rm -f /etc/systemd/system/sing-box.service
@@ -583,11 +581,9 @@ purge_uninstall() {
     systemctl daemon-reload
     echo -e "${GREEN}✔ sing-box 核心二进制及系统守护服务已注销。${NC}"
 
-    # 2. 粉碎配置路径
     rm -rf /etc/sing-box
     echo -e "${GREEN}✔ 节点核心配置文件夹已彻底抹除。${NC}"
 
-    # 3. 根除伪装前端站与处理 Nginx
     rm -rf /var/www/skyvault-drive
     
     if [ "$PURGE_NGINX_CONFIRM" = "y" ]; then
@@ -599,6 +595,7 @@ purge_uninstall() {
         rm -rf /etc/nginx /var/log/nginx /var/www/html
         echo -e "${GREEN}✔ Nginx 核心环境已完全从系统中剔除。${NC}"
     else
+        mkdir -p /etc/nginx/sites-available
         cat << EOF > /etc/nginx/sites-available/default
 server {
     listen 80 default_server;
@@ -615,7 +612,6 @@ EOF
         echo -e "${GREEN}✔ Nginx 规则已还原回系统纯净初始状态。${NC}"
     fi
 
-    # 4. 完全倒腾卸载 acme.sh 环境，拔掉 crontab 定时任务
     if [ -f "$HOME/.acme.sh/acme.sh" ]; then
         echo -e "${YELLOW}[*] 正在注销域名证书并解除系统 Crontab 定时任务...${NC}"
         if [ -n "$MY_DOMAIN" ]; then
@@ -626,14 +622,10 @@ EOF
         echo -e "${GREEN}✔ SSL 证书链与自动化定时任务已干净剔除。${NC}"
     fi
 
-    # 5. 清理可能残留的临时下载压缩包
     rm -f sing-box.tar.gz
-
-    # 6. 抹除系统级快捷方式和旧 alias
     rm -f /usr/local/bin/sk
     sed -i '/alias sk=/d' ~/.bashrc
     
-    # 7. 💥 终极自毁：删除脚本自身文件
     echo -e "${YELLOW}[*] 正在触发内核自毁，抹除脚本残留...${NC}"
     rm -f "/root/skybox.sh"
     rm -f "$0" 
@@ -677,7 +669,7 @@ while true; do
         6) modify_config ;;
         7) delete_config ;;
         8) purge_uninstall ;;
-        0) clear; exit 0 ;;
+        0; clear; exit 0 ;;
         *) echo -e "${RED}输入错误，请输入 0 到 8 的有效命令数字！${NC}" && sleep 1 ;;
     esac
 done
