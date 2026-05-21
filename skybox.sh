@@ -42,6 +42,11 @@ init_env() {
     fi
     source "$ENV_FILE"
 
+    # 🔥 【新增】核心黑科技：全自动配置本地 sk 快捷键
+    if ! grep -q "alias sk=" ~/.bashrc; then
+        echo "alias sk='/root/skybox.sh'" >> ~/.bashrc
+    fi
+
     # 检查并安装基础依赖
     if ! command -v jq &> /dev/null || ! command -v nginx &> /dev/null; then
         echo -e "${YELLOW}正在安装系统核心组件 (Nginx, jq, cron, socat, openssl)...${NC}"
