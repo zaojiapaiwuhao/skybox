@@ -73,7 +73,7 @@ install_singbox() {
         LATEST_VER="1.11.2" # 生产保底版本
     fi
     
-    # 🔍 【新增】本地版本校验逻辑
+    # 本地版本校验逻辑
     if command -v sing-box &> /dev/null; then
         LOCAL_VER=$(sing-box version 2>&1 | head -n 1 | awk '{print $3}')
         echo -e "${GREEN}当前本地已安装版本: v${LOCAL_VER}${NC}"
@@ -104,6 +104,7 @@ install_singbox() {
     systemctl stop sing-box &>/dev/null
     
     # 下载并部署
+    rm -f sing-box.tar.gz
     wget -O sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${LATEST_VER}/sing-box-${LATEST_VER}-${SINGBOX_ARCH}.tar.gz"
     
     if [ -f sing-box.tar.gz ] && [ -s sing-box.tar.gz ]; then
@@ -232,7 +233,7 @@ EOF
         return
     fi
 
-    # 渲染高度逼真暗黑科技风前端伪装页
+    # 渲染前端伪装页
     cat << 'EOF' > /var/www/skyvault-drive/index.html
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -321,7 +322,7 @@ server {
 EOF
 
     systemctl restart nginx
-    echo -e "${GREEN}SkyVault Drive 伪装系统已经自动就绪！后台定时无缝续签任务已挂载。${NC}"
+    echo -e "${GREEN}SkyVault Drive 伪装系统已经自动就绪！${NC}"
     read -p "按回车键返回..."
 }
 
@@ -507,7 +508,7 @@ delete_config() {
     read -p "按回车键返回..."
 }
 
-# 8. 🔥【新增】全场景无缝、纯净卸载环境逻辑
+# 8. 🔥 全场景无缝、纯净卸载环境 + 终极脚本自毁
 purge_uninstall() {
     clear
     echo -e "${RED}=================================================="
@@ -517,9 +518,10 @@ purge_uninstall() {
     echo -e " 1. 彻底杀死并解绑 sing-box 核心进程与系统守护服务"
     echo -e " 2. 彻底抹除核心配置目录及全部节点参数 (/etc/sing-box)"
     echo -e " 3. 清理 SkyVault Drive 前端伪装网站及页面源码"
-    echo -e " 4. 清理 Nginx 虚拟主机配置并平滑重置服务"
-    echo -e " 5. 吊销并粉碎 acme.sh 签发的本地 SSL 域名证书"
-    echo -e " 6. 抹除本地系统全局的 'sk' 快捷呼出暗号"
+    echo -e " 4. 彻底注销并粉碎 acme.sh 环境及 Cron 自动化定时续签任务"
+    echo -e " 5. 抹除本地系统全局的 'sk' 快捷呼出暗号"
+    echo -e " 6. 彻底粉碎本 VPS 本地存储的脚本自身文件"
+    echo -e " 7. 💡 可选：彻底铲除 Nginx 核心及其系统依赖组件"
     echo -e "${RED}==================================================${NC}"
     read -p "确认要将环境卸载得一干二净吗？请输入 (y/n): " PURGE_CONFIRM
     
@@ -528,6 +530,9 @@ purge_uninstall() {
         read -p "按回车键返回..."
         return
     fi
+
+    # 🔍 【核心增加细节】询问是否彻底铲除 Nginx 
+    read -p "是否同时彻底卸载 Nginx 核心组件及其全部系统依赖？(y/n): " PURGE_NGINX_CONFIRM
 
     echo -e "${YELLOW}[*] 正在执行全套清场轰炸...${NC}"
     source "$ENV_FILE" 2>/dev/null
@@ -538,16 +543,26 @@ purge_uninstall() {
     rm -f /etc/systemd/system/sing-box.service
     rm -f /usr/local/bin/sing-box
     systemctl daemon-reload
-    echo -e "${GREEN}✔ sing-box 核心二进制及服务已注销。${NC}"
+    echo -e "${GREEN}✔ sing-box 核心二进制及系统守护服务已注销。${NC}"
 
     # 2. 粉碎配置路径
     rm -rf /etc/sing-box
     echo -e "${GREEN}✔ 节点核心配置文件夹已彻底抹除。${NC}"
 
-    # 3. 根除伪装前端站与恢复 Nginx 纯净状态
+    # 3. 根除伪装前端站与处理 Nginx
     rm -rf /var/www/skyvault-drive
-    # 清空或重置默认 Nginx 虚拟主机配置文件
-    cat << EOF > /etc/nginx/sites-available/default
+    
+    if [ "$PURGE_NGINX_CONFIRM" = "y" ]; then
+        echo -e "${YELLOW}[*] 正在拔除 Nginx 服务及依赖残余...${NC}"
+        systemctl stop nginx &>/dev/null
+        systemctl disable nginx &>/dev/null
+        apt-get purge -y nginx nginx-common nginx-core &>/dev/null
+        apt-get autoremove -y &>/dev/null
+        rm -rf /etc/nginx /var/log/nginx /var/www/html
+        echo -e "${GREEN}✔ Nginx 核心环境已完全从系统中剔除。${NC}"
+    else
+        # 不卸载 Nginx，只将默认虚拟主机配置净化还原
+        cat << EOF > /etc/nginx/sites-available/default
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
@@ -559,26 +574,41 @@ server {
     }
 }
 EOF
-    systemctl restart nginx &>/dev/null
-    echo -e "${GREEN}✔ SkyVault Drive 伪装网页与相关 Nginx 规则已净化还原。${NC}"
-
-    # 4. 粉碎域名对应的 SSL 证书
-    if [ -n "$MY_DOMAIN" ] && [ -f "$HOME/.acme.sh/acme.sh" ]; then
-        echo -e "${YELLOW}[*] 正在向证书局解绑并卸载域名证书: $MY_DOMAIN ...${NC}"
-        ~/.acme.sh/acme.sh --remove -d "$MY_DOMAIN" --ecc &>/dev/null
-        rm -rf "$HOME/.acme.sh/${MY_DOMAIN}_ecc"
-        echo -e "${GREEN}✔ 本地本地 SSL 证书链已完全粉碎。${NC}"
+        systemctl restart nginx &>/dev/null
+        echo -e "${GREEN}✔ Nginx 规则已还原回系统纯净初始状态。${NC}"
     fi
 
-    # 5. 抹除别名暗号
+    # 4. 完全倒腾卸载 acme.sh 环境，拔掉 crontab 定时任务
+    if [ -f "$HOME/.acme.sh/acme.sh" ]; then
+        echo -e "${YELLOW}[*] 正在注销域名证书并解除系统 Crontab 定时任务...${NC}"
+        if [ -n "$MY_DOMAIN" ]; then
+            ~/.acme.sh/acme.sh --remove -d "$MY_DOMAIN" --ecc &>/dev/null
+        fi
+        ~/.acme.sh/acme.sh --uninstall &>/dev/null
+        rm -rf "$HOME/.acme.sh"
+        echo -e "${GREEN}✔ SSL 证书链与自动化定时任务已干净剔除。${NC}"
+    fi
+
+    # 5. 清理可能残留的临时下载压缩包
+    rm -f sing-box.tar.gz
+
+    # 6. 抹除别名暗号
     sed -i '/alias sk=/d' ~/.bashrc
     
+    # 7. 💥 终极自毁：删除脚本自身文件
+    echo -e "${YELLOW}[*] 正在触发内核自毁，抹除脚本残留...${NC}"
+    rm -f "/root/skybox.sh"
+    rm -f "$0" 
+    
     echo -e "${GREEN}=================================================="
-    echo -e "🎉 卸载完成！所有组件与残留已经清理得干干净净。"
-    echo -e "注：由于别名已被移除，本次退出后 'sk' 命令将不再可用。${NC}"
+    echo -e "🎉 净空完成！所有组件、配置、证书、定时任务、脚本文件已化为飞灰。"
+    if [ "$PURGE_NGINX_CONFIRM" = "y" ]; then
+        echo -e "连同 Nginx 也一起卷铺盖走人了！"
+    fi
+    echo -e "提示：请手动执行 'unalias sk' 或重新连接终端，以刷新清除当前窗口的内存别名缓存。"
     echo -e "${BLUE}==================================================${NC}"
     
-    # 彻底退出脚本
+    # 瞬间解脱退出
     exit 0
 }
 
@@ -596,7 +626,7 @@ while true; do
     echo -e " ${YELLOW}5) 查看现有节点配置与一键分享链接 (URL)${NC}"
     echo -e " ${BLUE}6) 更改/修改现有节点参数${NC}"
     echo -e " ${PURPLE}7) 删除指定不需要的代理节点${NC}"
-    echo -e " ${RED}8) 🚨 一键彻底卸载面板与所有相关组件 (清场还原)${NC}"
+    echo -e " ${RED}8) 🚨 一键彻底卸载面板、环境、定时任务、Nginx与脚本自毁 (干净利落)${NC}"
     echo -e " ${PLAIN}0) 优雅安全退出脚本${NC}"
     echo -e "${BLUE}==================================================${NC}"
     read -p "请选择操作 [0-8]: " CHOICE
